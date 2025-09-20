@@ -1,828 +1,561 @@
 import asyncio
 import logging
 import time
-import uuid
-import json
-import base64
-import tempfile
-import os
-from typing import Dict, List, Optional, AsyncGenerator, Any, Union
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-from contextlib import asynccontextmanager
+import os
+import ujson
+from typing import Dict, List, Optional, AsyncGenerator, Any, Union
+from functools import lru_cache
+import base64
+from datetime import datetime, timedelta
+import uuid
 
-# Load environment variables
+# 优化日志配置
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+# 禁用第三方库日志
+for lib in ["httpx", "httpcore", "uvicorn.access"]:
+    logging.getLogger(lib).setLevel(logging.ERROR)
+
+# 加载环境变量
+from dotenv import load_dotenv
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Constants
 VALID_API_KEYS = [key.strip() for key in os.getenv("VALID_API_KEYS", "").split(",") if key]
-DIFY_API_KEYS = [key.strip() for key in os.getenv("DIFY_API_KEYS", "").split(",") if key]
+CONVERSATION_MEMORY_MODE = int(os.getenv('CONVERSATION_MEMORY_MODE', '1'))
 DIFY_API_BASE = os.getenv("DIFY_API_BASE", "")
 TIMEOUT = float(os.getenv("TIMEOUT", 30.0))
 
-# === Data Models (Similar to Go structs) ===
+# 性能优化常量
+CONNECTION_POOL_SIZE = 100
+CONNECTION_TIMEOUT = float(os.getenv("TIMEOUT", 30.0))
+KEEPALIVE_TIMEOUT = 30.0
+TTL_APP_CACHE = timedelta(minutes=30)
 
-class MessageImageUrl(BaseModel):
-    url: str
-    detail: Optional[str] = "high"
-    mime_type: Optional[str] = None
+# 简化零宽字符映射
+ZERO_WIDTH_CHARS = ['\u200b', '\u200c', '\u200d', '\ufeff']
 
-class MessageContent(BaseModel):
-    type: str
-    text: Optional[str] = None
-    image_url: Optional[MessageImageUrl] = None
 
-class Message(BaseModel):
-    role: str
-    content: Union[str, List[MessageContent]]
-    name: Optional[str] = None
-    reasoning_content: Optional[str] = None
+class DifyModelManager:
+    """管理Dify模型与API密钥映射"""
+    def __init__(self):
+        self.api_keys = []
+        self.name_to_api_key = {}
+        self._app_cache = {}  # api_key -> (app_name, cached_time)
 
-class ToolCallFunction(BaseModel):
-    name: str
-    arguments: str
+        # 优化的HTTP客户端
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout=CONNECTION_TIMEOUT, connect=5.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=CONNECTION_POOL_SIZE,
+                max_connections=CONNECTION_POOL_SIZE,
+                keepalive_expiry=KEEPALIVE_TIMEOUT,
+            ),
+            http2=True,
+            verify=False,
+        )
+        self.load_api_keys()
 
-class ToolCall(BaseModel):
-    id: str
-    type: str = "function"
-    function: ToolCallFunction
+    def load_api_keys(self):
+        keys_str = os.getenv('DIFY_API_KEYS', '')
+        self.api_keys = [k.strip() for k in keys_str.split(',') if k.strip()]
 
-class GeneralOpenAIRequest(BaseModel):
-    model: str
-    messages: List[Message]
-    stream: bool = False
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    user: Optional[str] = None
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
-    stream_options: Optional[Dict[str, Any]] = None
-
-class DifyFile(BaseModel):
-    type: str
-    transfer_mode: str
-    url: Optional[str] = None
-    upload_file_id: Optional[str] = Field(None, alias="UploadFileId")
-
-    class Config:
-        populate_by_name = True
-
-class DifyChatRequest(BaseModel):
-    inputs: Dict[str, Any] = Field(default_factory=dict)
-    query: str
-    response_mode: str
-    user: str
-    files: Optional[List[DifyFile]] = None
-    auto_generate_name: bool = False
-
-class Usage(BaseModel):
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-
-class ChatCompletionsStreamResponseChoiceDelta(BaseModel):
-    content: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    role: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
-
-    def set_content_string(self, content: str):
-        self.content = content
-
-    def get_content_string(self) -> str:
-        return self.content or ""
-
-    def set_reasoning_content(self, content: str):
-        self.reasoning_content = content
-
-class ChatCompletionsStreamResponseChoice(BaseModel):
-    index: int = 0
-    delta: ChatCompletionsStreamResponseChoiceDelta
-    finish_reason: Optional[str] = None
-
-class ChatCompletionsStreamResponse(BaseModel):
-    id: str
-    object: str = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: List[ChatCompletionsStreamResponseChoice]
-    usage: Optional[Usage] = None
-
-class ChatCompletionChoice(BaseModel):
-    index: int = 0
-    message: Message
-    finish_reason: str
-
-class OpenAITextResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: Usage
-
-class DifyChunkChatCompletionResponse(BaseModel):
-    event: str
-    task_id: Optional[str] = None
-    id: Optional[str] = None
-    answer: Optional[str] = None
-    conversation_id: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-    data: Optional[Dict[str, Any]] = None
-    # 宽松解析 tool_calls，避免因字段不匹配被 Pydantic 丢掉
-    tool_calls: Optional[Any] = None
-
-    def get_tool_calls_as_openai(self) -> Optional[List[ToolCall]]:
-        """将原始 tool_calls 字段安全转换为 OpenAI ToolCall 格式"""
+    async def fetch_app_info(self, api_key: str) -> Optional[str]:
         try:
-            if not self.tool_calls:
-                return None
-            tool_calls_converted: List[ToolCall] = []
-            for tool in self.tool_calls:
-                # tool 可能是 dict 或已是 ToolCall
-                if isinstance(tool, ToolCall):
-                    tool_calls_converted.append(tool)
-                elif isinstance(tool, dict):
-                    func = tool.get("function", {})
-                    arguments_val = func.get("arguments", "")
-                    if not isinstance(arguments_val, str):
-                        import json as _json
-                        try:
-                            arguments_val = _json.dumps(arguments_val, ensure_ascii=False)
-                        except Exception:
-                            arguments_val = str(arguments_val)
-                    tool_calls_converted.append(ToolCall(
-                        id=tool.get("id", ""),
-                        type=tool.get("type", "function"),
-                        function=ToolCallFunction(
-                            name=func.get("name", ""),
-                            arguments=arguments_val
-                        )
-                    ))
-            return tool_calls_converted
-        except Exception as e:
-            import logging as _logging
-            _logging.error(f"Failed to parse tool_calls: {e}")
+            now = datetime.utcnow()
+            # 检查缓存
+            if api_key in self._app_cache:
+                cached_name, cached_time = self._app_cache[api_key]
+                if now - cached_time < TTL_APP_CACHE:
+                    return cached_name
+
+            headers = {"Authorization": f"Bearer {api_key}"}
+            rsp = await self._client.get(
+                f"{DIFY_API_BASE}/info",
+                headers=headers,
+                params={"user": "default_user"},
+                timeout=10.0
+            )
+
+            if rsp.status_code == 200:
+                app_info = ujson.loads(rsp.content)
+                app_name = app_info.get("name", "Unknown App")
+                self._app_cache[api_key] = (app_name, now)
+                return app_name
+            return None
+        except Exception:
             return None
 
-class DifyChatCompletionResponse(BaseModel):
-    conversation_id: str
-    answer: str
-    metadata: Dict[str, Any]
+    async def refresh_model_info(self):
+        """刷新模型映射"""
+        self.name_to_api_key.clear()
+        tasks = [self.fetch_app_info(key) for key in self.api_keys]
+        names = await asyncio.gather(*tasks, return_exceptions=True)
 
-# === HTTP Client ===
-http_client = httpx.AsyncClient(
-    timeout=TIMEOUT,
-    verify=False
-)
+        for key, name in zip(self.api_keys, names):
+            if isinstance(name, str):
+                self.name_to_api_key[name] = key
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting FastAPI Dify Proxy...")
-    if not VALID_API_KEYS:
-        logger.warning("VALID_API_KEYS not configured")
-    yield
-    logger.info("Shutting down...")
-    await http_client.aclose()
+    def get_api_key(self, model: str) -> Optional[str]:
+        return self.name_to_api_key.get(model)
 
-app = FastAPI(lifespan=lifespan)
+    def get_available_models(self) -> List[Dict[str, Any]]:
+        timestamp = int(time.time())
+        return [
+            {"id": name, "object": "model", "created": timestamp, "owned_by": "dify"}
+            for name in self.name_to_api_key.keys()
+        ]
+
+    async def close(self):
+        await self._client.aclose()
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        return self._client
+
+
+# 全局单例
+model_manager = DifyModelManager()
+
+app = FastAPI(title="Dify to OpenAI API Proxy", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    max_age=86400,
 )
 
-# === Authentication ===
-async def verify_api_key(request: Request) -> str:
-    auth = request.headers.get("Authorization")
-    if not auth or not auth.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": {
-                    "message": "Invalid API key",
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key"
-                }
-            }
-        )
 
-    api_key = auth[7:]
-    if api_key not in VALID_API_KEYS:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error": {
-                    "message": "Invalid API key",
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key"
-                }
-            }
-        )
-    return api_key
+# 简化的零宽字符编码
+@lru_cache(maxsize=256)
+def encode_conversation_id(conversation_id: str) -> str:
+    """简化的conversation_id编码"""
+    if not conversation_id:
+        return ""
 
-# === File Upload Helper ===
-async def upload_dify_file(image_url: str, user: str, dify_api_key: str) -> Optional[DifyFile]:
-    """Upload base64 image to Dify and return file info"""
-    try:
-        # Extract base64 data
-        if "," in image_url:
-            base64_data = image_url.split(",")[1]
-        else:
-            base64_data = image_url
+    # 使用简单的base64编码 + 零宽字符
+    encoded = base64.b64encode(conversation_id.encode('utf-8')).decode('ascii')
+    # 用零宽字符替换部分字符使其不可见
+    result = ""
+    for i, char in enumerate(encoded):
+        if i % 4 == 0:  # 每4个字符插入一个零宽字符
+            result += ZERO_WIDTH_CHARS[i % len(ZERO_WIDTH_CHARS)]
+        result += char
+    return result
 
-        # Decode base64
-        decoded_data = base64.b64decode(base64_data)
-
-        # Create temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-            temp_file.write(decoded_data)
-            temp_file.flush()
-
-            # Prepare multipart form data
-            files = {
-                'file': ('image.jpg', decoded_data, 'image/jpeg')
-            }
-            data = {
-                'user': user
-            }
-            headers = {
-                'Authorization': f'Bearer {dify_api_key}'
-            }
-
-            # Upload to Dify
-            upload_url = f"{DIFY_API_BASE}/files/upload"
-            response = await http_client.post(
-                upload_url,
-                files=files,
-                data=data,
-                headers=headers
-            )
-
-            # Clean up temp file
-            os.unlink(temp_file.name)
-
-            if response.status_code == 200:
-                result = response.json()
-                return DifyFile(
-                    type="image",
-                    transfer_mode="local_file",
-                    upload_file_id=result.get("id")
-                )
-
-    except Exception as e:
-        logger.error(f"Failed to upload file: {e}")
-
-    return None
-
-# === Request Conversion ===
-async def request_openai_to_dify(request: GeneralOpenAIRequest, dify_api_key: str) -> DifyChatRequest:
-    """Convert OpenAI request to Dify request format"""
-    user = request.user or str(uuid.uuid4())
-    files = []
-    content_builder = []
-
-    for message in request.messages:
-        role_prefix = {
-            "system": "SYSTEM: ",
-            "assistant": "ASSISTANT: ",
-            "user": "USER: "
-        }.get(message.role, f"{message.role.upper()}: ")
-
-        if isinstance(message.content, str):
-            content_builder.append(f"{role_prefix}\n{message.content}\n")
-        else:
-            # Handle complex message content
-            text_parts = []
-            for content_item in message.content:
-                if content_item.type == "text":
-                    text_parts.append(content_item.text or "")
-                elif content_item.type == "image_url" and content_item.image_url:
-                    image_url = content_item.image_url.url
-                    if image_url.startswith("http"):
-                        # Remote image
-                        files.append(DifyFile(
-                            type="image",
-                            transfer_mode="remote_url",
-                            url=image_url
-                        ))
-                    else:
-                        # Base64 image - upload to Dify
-                        uploaded_file = await upload_dify_file(image_url, user, dify_api_key)
-                        if uploaded_file:
-                            files.append(uploaded_file)
-
-            if text_parts:
-                content_builder.append(f"{role_prefix}\n{''.join(text_parts)}\n")
-
-    query = "".join(content_builder)
-    # Always use streaming mode for Dify - Agent Chat App doesn't support blocking mode
-    response_mode = "streaming"
-
-    return DifyChatRequest(
-        inputs={},
-        query=query,
-        response_mode=response_mode,
-        user=user,
-        files=files if files else None,
-        auto_generate_name=False
-    )
-
-# === Stream Response Conversion ===
-def stream_response_dify_to_openai(dify_response: DifyChunkChatCompletionResponse, model: str, completion_id: str, created: int) -> Optional[ChatCompletionsStreamResponse]:
-    """Convert Dify stream chunk to OpenAI format"""
-    response = ChatCompletionsStreamResponse(
-        id=completion_id,
-        object="chat.completion.chunk",
-        created=created,
-        model=model,
-        choices=[]
-    )
-
-    choice = ChatCompletionsStreamResponseChoice(
-        index=0,
-        delta=ChatCompletionsStreamResponseChoiceDelta()
-    )
-
-    # Handle different Dify event types
-    if dify_response.event.startswith("workflow_"):
-        # Workflow events - add as reasoning content for debugging
-        if dify_response.data and dify_response.data.get("workflow_id"):
-            text = f"Workflow: {dify_response.data['workflow_id']}"
-            if dify_response.event == "workflow_finished":
-                text += f" {dify_response.data.get('status', '')}"
-            choice.delta.set_reasoning_content(text + "\n")
-
-    elif dify_response.event.startswith("node_"):
-        # Node events - add as reasoning content for debugging
-        if dify_response.data and dify_response.data.get("node_type"):
-            text = f"Node: {dify_response.data['node_type']}"
-            if dify_response.event == "node_finished":
-                text += f" {dify_response.data.get('status', '')}"
-            choice.delta.set_reasoning_content(text + "\n")
-
-    elif dify_response.event in ["message", "agent_message"]:
-        # Main message content
-        content = dify_response.answer or ""
-
-        # Handle special thinking tags
-        if content == '<details style="color:gray;background-color: #f8f8f8;padding: 8px;border-radius: 4px;" open> <summary> Thinking... </summary>\n':
-            content = "<think>"
-        elif content == "</details>":
-            content = "</think>"
-
-        choice.delta.set_content_string(content)
-
-    # Handle tool calls if present
-    # 新的 ToolCall 转换逻辑（即便 tool_calls 是原始 dict 也可处理）
-    tool_calls_safe = getattr(dify_response, "get_tool_calls_as_openai", lambda: None)()
-    if tool_calls_safe:
-        # 为了调试 Dify 返回的 tool_calls，这里打印原始 JSON 内容
-        try:
-            import logging as _logging
-            _logging.getLogger(__name__).info(f"Raw tool_calls from Dify chunk: {getattr(dify_response, 'tool_calls', None)}")
-        except Exception:
-            pass
-        choice.delta.tool_calls = tool_calls_safe
-
-    response.choices.append(choice)
-    return response
-
-# === Stream Handler ===
-async def dify_stream_handler(dify_response: httpx.Response, model: str) -> AsyncGenerator[str, None]:
-    """Handle Dify streaming response and convert to OpenAI format"""
-    completion_id = f"chatcmpl-{uuid.uuid4()}"
-    created = int(time.time())
-    usage = Usage()
-
-    if dify_response.status_code != 200:
-        # Handle error response
-        try:
-            response_text = await dify_response.aread()
-            error_content = json.loads(response_text.decode())
-            error_msg = {
-                "error": {
-                    "message": error_content.get("message", f"Dify API error: Status {dify_response.status_code}"),
-                    "type": error_content.get("type", "server_error"),
-                    "code": error_content.get("code", dify_response.status_code)
-                }
-            }
-        except Exception:
-            error_msg = {
-                "error": {
-                    "message": f"Dify API error: Status {dify_response.status_code}",
-                    "type": "server_error",
-                    "code": dify_response.status_code
-                }
-            }
-        yield f"data: {json.dumps(error_msg)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+def decode_conversation_id(content: str) -> Optional[str]:
+    """简化的conversation_id解码"""
+    if not content:
+        return None
 
     try:
-        async for line in dify_response.aiter_lines():
-            if not line or not line.startswith("data: "):
-                continue
+        # 移除零宽字符
+        cleaned = ""
+        for char in content:
+            if char not in ZERO_WIDTH_CHARS:
+                cleaned += char
 
-            data = line[6:].strip()
-            if data == "[DONE]":
-                break
-
+        # 反向查找base64字符串
+        for i in range(len(cleaned) - 4, -1, -1):
             try:
-                chunk_data = json.loads(data)
-                dify_chunk = DifyChunkChatCompletionResponse(**chunk_data)
-
-                if dify_chunk.event == "message_end":
-                    # Extract usage info
-                    if dify_chunk.metadata and "usage" in dify_chunk.metadata:
-                        usage_data = dify_chunk.metadata["usage"]
-                        usage = Usage(
-                            prompt_tokens=usage_data.get("prompt_tokens", 0),
-                            completion_tokens=usage_data.get("completion_tokens", 0),
-                            total_tokens=usage_data.get("total_tokens", 0)
-                        )
-
-                    # Send final chunk with finish reason
-                    final_response = ChatCompletionsStreamResponse(
-                        id=completion_id,
-                        created=created,
-                        model=model,
-                        choices=[ChatCompletionsStreamResponseChoice(
-                            index=0,
-                            delta=ChatCompletionsStreamResponseChoiceDelta(),
-                            finish_reason="stop"
-                        )],
-                        usage=usage
-                    )
-                    yield f"data: {final_response.model_dump_json()}\n\n"
-                    break
-
-                elif dify_chunk.event == "error":
-                    # Handle error event
-                    error_msg = {
-                        "error": {
-                            "message": chunk_data.get("message", "Unknown error"),
-                            "type": "server_error",
-                            "code": chunk_data.get("code", 500)
-                        }
-                    }
-                    yield f"data: {json.dumps(error_msg)}\n\n"
-                    break
-
-                else:
-                    # Convert and send regular chunk
-                    openai_response = stream_response_dify_to_openai(dify_chunk, model, completion_id, created)
-                    if openai_response and openai_response.choices:
-                        # 调试输出原始 chunk JSON，直接查看 tool_calls
-                        try:
-                            import logging as _logging
-                            _logging.getLogger(__name__).info(f"Full raw Dify chunk: {json.dumps(chunk_data, ensure_ascii=False)}")
-                        except Exception:
-                            pass
-                        yield f"data: {openai_response.model_dump_json()}\n\n"
-
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON: {data}, error: {e}")
+                potential_b64 = cleaned[i:]
+                if len(potential_b64) % 4 == 0:
+                    decoded = base64.b64decode(potential_b64).decode('utf-8')
+                    return decoded
+            except:
                 continue
+        return None
+    except Exception:
+        return None
 
-    except Exception as e:
-        logger.error(f"Stream processing error: {e}")
-        error_msg = {
-            "error": {
-                "message": f"Stream processing error: {str(e)}",
-                "type": "server_error",
-                "code": 500
+
+# 自定义异常
+class HTTPUnauthorized(HTTPException):
+    def __init__(self, message):
+        super().__init__(
+            status_code=401,
+            detail={"error": {"message": message, "type": "invalid_request_error"}}
+        )
+
+# 依赖注入
+async def verify_api_key(request: Request) -> str:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPUnauthorized("Invalid Authorization header")
+
+    key = auth_header[7:]
+    if not key or key not in VALID_API_KEYS:
+        raise HTTPUnauthorized("Invalid API key")
+    return key
+
+
+# 业务函数 - JSON转换
+def transform_openai_to_dify(openai_request: Dict, endpoint: str) -> Optional[Dict]:
+    if endpoint != "/chat/completions" or not openai_request.get("messages"):
+        return None
+
+    messages = openai_request["messages"]
+    stream = openai_request.get("stream", False)
+    system_content = ""
+    user_query = ""
+
+    # 提取system消息
+    for m in messages:
+        if m.get("role") == "system":
+            system_content = m.get("content", "")
+            break
+
+    # 处理最后一条用户消息
+    last_message = messages[-1]
+    if last_message.get("role") == "user":
+        content = last_message.get("content", "")
+        if isinstance(content, list):
+            # 多模态内容，只提取文本
+            user_query = " ".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        else:
+            user_query = content
+
+    # 处理工具调用
+    tools = openai_request.get("tools", [])
+    tool_choice = openai_request.get("tool_choice", "auto")
+
+    if CONVERSATION_MEMORY_MODE == 2:
+        conversation_id = None
+        if len(messages) > 1:
+            for m in reversed(messages[:-1]):
+                if m.get("role") == "assistant":
+                    conversation_id = decode_conversation_id(m.get("content", ""))
+                    if conversation_id:
+                        break
+
+        if system_content and not conversation_id:
+            user_query = f"系统指令: {system_content}\n\n用户问题: {user_query}"
+
+        dify_request = {
+            "inputs": {},
+            "query": user_query,
+            "response_mode": "streaming" if stream else "blocking",
+            "conversation_id": conversation_id,
+            "user": openai_request.get("user", "default_user")
+        }
+    else:
+        # history模式
+        if len(messages) > 1:
+            history_msg = []
+            has_system = any(m.get("role") == "system" for m in messages[:-1])
+            for m in messages[:-1]:
+                role, content = m.get("role", ""), m.get("content", "")
+                if role and content:
+                    history_msg.append(f"{role}: {content}")
+
+            if system_content and not has_system:
+                history_msg.insert(0, f"system: {system_content}")
+
+            if history_msg:
+                history_txt = "\n\n".join(history_msg)
+                user_query = f"<history>\n{history_txt}\n</history>\n\n用户当前问题: {user_query}"
+        elif system_content:
+            user_query = f"系统指令: {system_content}\n\n用户问题: {user_query}"
+
+        dify_request = {
+            "inputs": {},
+            "query": user_query,
+            "response_mode": "streaming" if stream else "blocking",
+            "user": openai_request.get("user", "default_user")
+        }
+
+    # 添加工具支持
+    if tools:
+        dify_request["tools"] = transform_tools_to_dify(tools, tool_choice)
+
+    return dify_request
+
+
+def transform_tools_to_dify(tools: List[Dict], tool_choice: Union[str, Dict] = "auto") -> Dict:
+    """将OpenAI工具格式转换为Dify格式"""
+    dify_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.get("function", {}).get("name", ""),
+                "description": tool.get("function", {}).get("description", ""),
+                "parameters": tool.get("function", {}).get("parameters", {})
             }
         }
-        yield f"data: {json.dumps(error_msg)}\n\n"
+        for tool in tools if tool.get("type") == "function"
+    ]
 
-    yield "data: [DONE]\n\n"
+    result = {"tools": dify_tools}
 
-# === Stream Collector for Non-Stream Requests ===
-async def collect_dify_stream_response(dify_response: httpx.Response, model: str) -> OpenAITextResponse:
-    """Collect streaming response and convert to non-streaming OpenAI format"""
-    completion_id = f"chatcmpl-{uuid.uuid4()}"
-    created = int(time.time())
-    usage = Usage()
-    collected_content = []
+    # 处理tool_choice
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        result["tool_choice"] = {
+            "type": "function",
+            "function": {"name": tool_choice.get("function", {}).get("name", "")}
+        }
+    elif tool_choice == "none":
+        result["tool_choice"] = "none"
+    else:
+        result["tool_choice"] = "auto"
 
-    if dify_response.status_code != 200:
-        # Handle error response
-        error_message = f"Dify API error: Status {dify_response.status_code}"
-        try:
-            response_text = await dify_response.aread()
-            error_content = json.loads(response_text.decode())
-            error_message = error_content.get("message", error_message)
-            logger.error(f"Dify API error response: {error_content}")
-        except Exception as e:
-            logger.error(f"Failed to parse Dify error response: {e}")
-
-        raise HTTPException(
-            status_code=dify_response.status_code,
-            detail={
-                "error": {
-                    "message": error_message,
-                    "type": "server_error",
-                    "code": dify_response.status_code
-                }
-            }
-        )
-
-    try:
-        async for line in dify_response.aiter_lines():
-            if not line or not line.startswith("data: "):
-                continue
-
-            data = line[6:].strip()
-            if data == "[DONE]":
-                break
-
-            try:
-                chunk_data = json.loads(data)
-                dify_chunk = DifyChunkChatCompletionResponse(**chunk_data)
-
-                if dify_chunk.event == "message_end":
-                    # Extract usage info
-                    if dify_chunk.metadata and "usage" in dify_chunk.metadata:
-                        usage_data = dify_chunk.metadata["usage"]
-                        usage = Usage(
-                            prompt_tokens=usage_data.get("prompt_tokens", 0),
-                            completion_tokens=usage_data.get("completion_tokens", 0),
-                            total_tokens=usage_data.get("total_tokens", 0)
-                        )
-                    break
-
-                elif dify_chunk.event == "error":
-                    # Handle error event
-                    error_msg = chunk_data.get("message", "Unknown error")
-                    raise HTTPException(
-                        status_code=500,
-                        detail={
-                            "error": {
-                                "message": error_msg,
-                                "type": "server_error",
-                                "code": chunk_data.get("code", 500)
-                            }
-                        }
-                    )
-
-                elif dify_chunk.event in ["message", "agent_message"]:
-                    # Collect message content
-                    content = dify_chunk.answer or ""
-
-                    # Handle special thinking tags
-                    if content == '<details style="color:gray;background-color: #f8f8f8;padding: 8px;border-radius: 4px;" open> <summary> Thinking... </summary>\n':
-                        content = "<think>"
-                    elif content == "</details>":
-                        content = "</think>"
-
-                    collected_content.append(content)
-
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON: {data}, error: {e}")
-                continue
-
-    except Exception as e:
-        logger.error(f"Stream collection error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": {
-                    "message": f"Stream processing error: {str(e)}",
-                    "type": "server_error",
-                    "code": 500
-                }
-            }
-        )
-
-    # Build final response
-    final_content = "".join(collected_content)
-
-    return OpenAITextResponse(
-        id=completion_id,
-        created=created,
-        model=model,
-        choices=[ChatCompletionChoice(
-            index=0,
-            message=Message(
-                role="assistant",
-                content=final_content
-            ),
-            finish_reason="stop"
-        )],
-        usage=usage
-    )
+    return result
 
 
-# === Models List Endpoint ===
-class ModelManager:
-    def __init__(self):
-        self.name_to_api_key: Dict[str, str] = {}
-        self.last_refresh_time: Optional[int] = None
+def stream_transform(dify_response: Dict, model: str, stream: bool) -> Dict:
+    if stream:
+        return dify_response
 
-    async def refresh_model_info(self):
-        if not DIFY_API_KEYS or not DIFY_API_BASE:
-            logger.warning("Dify API configuration missing")
-            return
-        try:
-            dify_api_key = DIFY_API_KEYS[0]
-            headers = {
-                "Authorization": f"Bearer {dify_api_key}",
-                "Content-Type": "application/json"
-            }
-            # 先尝试 /models，如404则退回到 /info
-            resp = await http_client.get(f"{DIFY_API_BASE}/models", headers=headers)
-            if resp.status_code == 404:
-                logger.warning(f"/models endpoint not found, trying /info for each API key instead")
-                # 对每个 API Key 分别调用 /info
-                for key in DIFY_API_KEYS:
-                    headers_each = {
-                        "Authorization": f"Bearer {key}",
-                        "Content-Type": "application/json"
-                    }
-                    info_resp = await http_client.get(f"{DIFY_API_BASE}/info", headers=headers_each)
-                    if info_resp.status_code == 200:
-                        app_info = info_resp.json()
-                        app_name = app_info.get("name")
-                        if app_name:
-                            self.name_to_api_key[app_name] = key
-                            logger.info(f"Added model(app) from /info: {app_name}")
-                    else:
-                        logger.error(f"Failed to fetch /info for key {key[:6]}..., status: {info_resp.status_code}")
-                self.last_refresh_time = int(time.time())
-                return
-            elif resp.status_code != 200:
-                logger.error(f"Failed to refresh model info: {resp.status_code} {resp.text}")
-                return
+    answer = dify_response.get("answer", "")
+    tool_calls = []
 
-            logger.info(f"Dify /models raw response: {resp.text}")
-            result = resp.json()
-            self.name_to_api_key.clear()
-            # 针对可能不在 data 里的情况，直接遍历 root 列表
-            models_list = result.get("data", result)
-            if isinstance(models_list, dict) and "models" in models_list:
-                models_list = models_list["models"]
-            if not isinstance(models_list, list):
-                logger.warning(f"Unexpected /models format: {models_list}")
-                models_list = []
-            for m in models_list:
-                model_id = m.get("id") or m.get("name")
-                if model_id:
-                    logger.info(f"Adding model: {model_id}")
-                    self.name_to_api_key[model_id] = dify_api_key
-            self.last_refresh_time = int(time.time())
-        except Exception as e:
-            logger.error(f"Error refreshing model info: {e}")
-
-    def get_available_models(self) -> List[Dict[str, Any]]:
-        timestamp = int(time.time())
-        return [
+    # 处理工具调用
+    if "tool_calls" in dify_response:
+        tool_calls = [
             {
-                "id": name,
-                "object": "model",
-                "created": timestamp,
-                "owned_by": "dify"
+                "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
+                "type": "function",
+                "function": {
+                    "name": tc.get("function", {}).get("name", ""),
+                    "arguments": ujson.dumps(tc.get("function", {}).get("arguments", {}))
+                }
             }
-            for name in self.name_to_api_key.keys()
+            for tc in dify_response["tool_calls"]
         ]
 
+    # 处理agent_thoughts
+    if not answer:
+        agent_thoughts = dify_response.get("agent_thoughts")
+        if agent_thoughts:
+            for thought in reversed(agent_thoughts):
+                thought_content = thought.get("thought")
+                if thought_content:
+                    answer = thought_content
+                    break
 
-model_manager = ModelManager()
+    # 对话ID编码
+    if CONVERSATION_MEMORY_MODE == 2:
+        conversation_id = dify_response.get("conversation_id", "")
+        if conversation_id:
+            history = dify_response.get("conversation_history", [])
+            has_id = any(
+                msg.get("role") == "assistant" and decode_conversation_id(msg.get("content", ""))
+                for msg in history
+            )
+            if not has_id:
+                answer += encode_conversation_id(conversation_id)
+
+    # 构建响应
+    message_content = {"role": "assistant", "content": answer}
+    if tool_calls:
+        message_content["tool_calls"] = tool_calls
+
+    return {
+        "id": dify_response.get("message_id", ""),
+        "object": "chat.completion",
+        "created": dify_response.get("created", int(time.time())),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message_content,
+            "finish_reason": "tool_calls" if tool_calls else "stop"
+        }]
+    }
+
+
+# --------------------------
+# 核心路由 - /chat/completions
+# --------------------------
+async def stream_response(dify_request: Dict, api_key: str, model: str) -> AsyncGenerator[str, None]:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    endpoint = f"{DIFY_API_BASE}/chat-messages"
+    message_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+
+    def make_chunk(content: str = "", tool_calls: List[Dict] = None, final=False):
+        chunk = {
+            "id": message_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": None
+            }]
+        }
+
+        if content:
+            chunk["choices"][0]["delta"]["content"] = content
+        if tool_calls:
+            chunk["choices"][0]["delta"]["tool_calls"] = tool_calls
+        if final:
+            chunk["choices"][0]["finish_reason"] = "tool_calls" if tool_calls else "stop"
+
+        return f"data: {ujson.dumps(chunk)}\n\n"
+
+    async with model_manager.client.stream('POST', endpoint, json=dify_request, headers=headers) as rsp:
+        if rsp.status_code != 200:
+            yield make_chunk("Stream connection failed", final=True)
+            yield "data: [DONE]\n\n"
+            return
+
+        buffer = b""
+        async for chunk in rsp.aiter_bytes(8192):
+            buffer += chunk
+
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+
+                if not line.startswith(b"data: "):
+                    continue
+
+                try:
+                    data = ujson.loads(line[6:])
+                    event_type = data.get("event")
+
+                    if event_type in ("message", "agent_message"):
+                        answer = data.get("answer", "")
+                        if answer:
+                            yield make_chunk(answer)
+
+                    elif event_type == "agent_thought":
+                        thought = data.get("thought", "")
+                        if thought:
+                            yield make_chunk(thought)
+
+                    elif event_type == "tool_calls":
+                        tool_calls = data.get("tool_calls", [])
+                        if tool_calls:
+                            openai_tools = [
+                                {
+                                    "id": tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.get("function", {}).get("name", ""),
+                                        "arguments": ujson.dumps(tc.get("function", {}).get("arguments", {}))
+                                    }
+                                }
+                                for tc in tool_calls
+                            ]
+                            yield make_chunk(tool_calls=openai_tools)
+
+                    elif event_type == "message_end":
+                        yield make_chunk("", final=True)
+                        yield "data: [DONE]\n\n"
+                        return
+
+                except:
+                    continue
+
+        yield make_chunk("", final=True)
+        yield "data: [DONE]\n\n"
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, api_key: str = Depends(verify_api_key)):
+    try:
+        request_body = await request.body()
+        openai_request = ujson.loads(request_body)
+        model = openai_request.get("model", "claude-3-5-sonnet-v2")
+
+        # 检查模型可用性
+        dify_key = model_manager.get_api_key(model)
+        if not dify_key:
+            raise HTTPException(status_code=404, detail={"error": {"message": f"Model {model} not configured"}})
+
+        dify_req = transform_openai_to_dify(openai_request, "/chat/completions")
+        if not dify_req:
+            raise HTTPException(status_code=400, detail={"error": {"message": "Invalid format"}})
+
+        stream = openai_request.get("stream", False)
+        if stream:
+            return StreamingResponse(
+                stream_response(dify_req, dify_key, model),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
+
+        # 非流式调用
+        headers = {"Authorization": f"Bearer {dify_key}", "Content-Type": "application/json"}
+        endpoint = f"{DIFY_API_BASE}/chat-messages"
+
+        resp = await model_manager.client.post(
+            endpoint,
+            content=ujson.dumps(dify_req),
+            headers=headers,
+            timeout=20.0
+        )
+
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+        dify_resp = ujson.loads(resp.content)
+        openai_resp = stream_transform(dify_resp, model, stream=False)
+
+        return Response(
+            content=ujson.dumps(openai_resp),
+            media_type="application/json",
+            headers={"access-control-allow-origin": "*"}
+        )
+
+    except HTTPException:
+        raise
+    except ujson.JSONDecodeError:
+        raise HTTPException(status_code=400, detail={"error": {"message": "Invalid JSON format"}})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": {"message": str(e)}})
 
 
 @app.get("/v1/models")
-async def list_models(api_key: str = Depends(verify_api_key)):
-    """
-    避免每次都刷新，采用懒加载策略获取模型列表
-    """
+async def list_models():
     if not model_manager.name_to_api_key:
         await model_manager.refresh_model_info()
+
     models = model_manager.get_available_models()
-    resp = {"object": "list", "data": models}
-    # 使用ujson和直接返回Response提升性能
     return Response(
-        content=json.dumps(resp, ensure_ascii=False),
+        content=ujson.dumps({"object": "list", "data": models}),
         media_type="application/json",
         headers={"access-control-allow-origin": "*"}
     )
 
-@app.post("/v1/chat/completions")
-async def chat_completions(
-    request: GeneralOpenAIRequest,
-    api_key: str = Depends(verify_api_key)
-):
-    try:
-        # Validate Dify API configuration
-        dify_api_key = DIFY_API_KEYS[0] if DIFY_API_KEYS else ""
-        if not dify_api_key or not DIFY_API_BASE:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": {
-                        "message": "Server configuration error: Dify API not configured",
-                        "type": "server_error",
-                        "code": 500
-                    }
-                }
-            )
 
-        # Convert request
-        dify_request = await request_openai_to_dify(request, dify_api_key)
+# 应用生命周期
+@app.on_event("startup")
+async def startup():
+    if not VALID_API_KEYS:
+        logger.warning("VALID_API_KEYS not configured")
+    await model_manager.refresh_model_info()
 
-        # Debug: Log the Dify request
-        logger.info(f"Dify request: {dify_request.model_dump()}")
+@app.on_event("shutdown")
+async def shutdown():
+    await model_manager.close()
 
-        # Prepare headers
-        headers = {
-            "Authorization": f"Bearer {dify_api_key}",
-            "Content-Type": "application/json"
-        }
 
-        # Send request to Dify - Always use streaming since Agent Chat App doesn't support blocking
-        if request.stream:
-            # Streaming request - keep stream open for StreamingResponse
-            async def stream_with_dify():
-                async with http_client.stream(
-                    "POST",
-                    f"{DIFY_API_BASE}/chat-messages",
-                    json=dify_request.model_dump(),
-                    headers=headers,
-                    timeout=60.0
-                ) as dify_response:
-                    async for chunk in dify_stream_handler(dify_response, request.model):
-                        yield chunk
-
-            return StreamingResponse(
-                stream_with_dify(),
-                media_type="text/event-stream"
-            )
-        else:
-            # Non-streaming request - collect streaming response and convert
-            async with http_client.stream(
-                "POST",
-                f"{DIFY_API_BASE}/chat-messages",
-                json=dify_request.model_dump(),
-                headers=headers,
-                timeout=60.0
-            ) as dify_response:
-                openai_response = await collect_dify_stream_response(dify_response, request.model)
-                return openai_response
-
-    except HTTPException as he:
-        # Re-raise HTTPException with proper error format
-        if hasattr(he, 'detail') and isinstance(he.detail, dict):
-            raise he
-        else:
-            # Convert plain HTTPException to proper error format
-            raise HTTPException(
-                status_code=he.status_code,
-                detail={
-                    "error": {
-                        "message": str(he.detail) if he.detail else f"HTTP {he.status_code} error",
-                        "type": "server_error",
-                        "code": he.status_code
-                    }
-                }
-            )
-    except Exception as e:
-        logger.error(f"Chat completions error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": {
-                    "message": f"Internal server error: {str(e)}",
-                    "type": "server_error",
-                    "code": 500
-                }
-            }
-        )
-
-def main():
+if __name__ == '__main__':
     import uvicorn
+
     host = os.getenv("SERVER_HOST", "127.0.0.1")
     port = int(os.getenv("SERVER_PORT", 8000))
+    workers = int(os.getenv("WORKERS", 1))
 
     uvicorn.run(
         app,
         host=host,
         port=port,
-        log_level="info"
+        workers=workers,
+        access_log=False,
+        server_header=False,
+        date_header=False,
+        loop="uvloop" if os.name != 'nt' else "asyncio",
     )
-
-if __name__ == "__main__":
-    main()

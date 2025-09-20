@@ -1,110 +1,71 @@
 # OpenDify
 
-[![EN](https://img.shields.io/badge/EN-English%20Version-blue?style=flat&logo=github)](README_EN.md)
-
 ## 简介
 
-OpenDify 是一个 **高性能的 FastAPI 代理服务**，可以将 [Dify](https://dify.ai) API 转换为 **OpenAI 兼容格式 API**。
+OpenDify 是一个 **极致优化的高性能 FastAPI 代理服务**，可以将 [Dify](https://dify.ai) API 转换为 **OpenAI 兼容格式 API**。
 借助 OpenDify，您可以用任何 OpenAI 风格的 SDK 或客户端直接访问 Dify 应用，无需修改现有基于 OpenAI 的代码或工作流。
-
-适用于希望在保持 OpenAI 客户端生态的同时，接入 Dify 多模态 AI 能力的开发者。
-
----
-
-## ✨ 功能特性
-
-- **完全 OpenAI API 兼容** —— 支持 `/v1/chat/completions` 与 `/v1/models` 接口
-- **支持流式响应** —— 从 Dify 到客户端的低延迟数据流转发
-- **多模态消息支持** —— 可处理 `text` 与 `image_url` 类型消息
-- **工具调用格式转换** —— 将 Dify 工具调用事件转换为 OpenAI 函数调用格式
-- **自动文件上传** —— 支持远程 URL 和 Base64 图片上传至 Dify
-- **全局 HTTP 连接池** —— 保持长连接并启用 HTTP/2，提升吞吐量
-- **环境变量可配置** —— 通过 `.env` 文件完全控制运行参数
-
----
 
 ## 🛠 快速开始
 
-### 1. 安装依赖
+### 1. 环境要求
+- Python 3.8+
+
+### 2. 安装依赖
 ```bash
+# 克隆项目
+git clone https://github.com/realnghon/OpenDify.git
+cd OpenDify
+
+# 安装依赖
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境
+### 3. 配置环境
 在项目根目录创建 `.env` 文件：
 ```env
+# 必需配置
 VALID_API_KEYS=your_proxy_access_key_1,your_proxy_access_key_2
-DIFY_API_KEYS=your_dify_api_key
-DIFY_API_BASE=https://your_dify_instance_base
+DIFY_API_KEYS=your_dify_api_key_1,your_dify_api_key_2
+DIFY_API_BASE=https://api.dify.ai/v1
+
+# 可选配置
 TIMEOUT=30.0
 SERVER_HOST=127.0.0.1
 SERVER_PORT=8000
+CONVERSATION_MEMORY_MODE=1
+WORKERS=1
 ```
 
-### 3. 启动服务
-**开发模式**
+### 4. 启动服务
+**开发模式（推荐用于测试）**
 ```bash
 python -m uvicorn app:app --reload --host 127.0.0.1 --port 8000
 ```
 
-**生产模式**
+**生产模式（推荐用于部署）**
 ```bash
 python app.py
 ```
 
 ---
 
-## 🚀 使用示例 (Python OpenAI SDK)
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://127.0.0.1:8000/v1",
-    api_key="your_proxy_access_key"
-)
-
-# 流式对话
-response = client.chat.completions.create(
-    model="你的Dify应用名称",
-    messages=[{"role": "user", "content": "你好"}],
-    stream=True
-)
-
-for chunk in response:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
-```
-
----
-
 ## 🔧 配置项说明
 
-| 环境变量               | 说明                                  | 默认值       |
-|------------------------|---------------------------------------|--------------|
-| `VALID_API_KEYS`       | 允许访问代理的 API Key 列表           | `-`          |
-| `DIFY_API_KEYS`        | 用于请求 Dify API 的密钥               | `-`          |
-| `DIFY_API_BASE`        | Dify API 的基础 URL                   | `-`          |
-| `TIMEOUT`              | 请求超时时间（秒）                     | `30.0`       |
-| `SERVER_HOST`          | 代理服务监听主机                       | `127.0.0.1`  |
-| `SERVER_PORT`          | 代理服务监听端口                       | `8000`       |
+| 环境变量               | 说明                                                                                                                   | 默认值       | 示例值 |
+|------------------------|------------------------------------------------------------------------------------------------------------------------|--------------|--------|
+| `VALID_API_KEYS`       | 允许访问代理的 API Key 列表（逗号分隔）                                                                                             | `-`          | `sk-abc123,sk-def456` |
+| `DIFY_API_KEYS`        | 用于请求 Dify API 的密钥列表（逗号分隔，支持多个应用）                                                                                                | `-`          | `app-abc123,app-def456` |
+| `DIFY_API_BASE`        | Dify API 的基础 URL                                                                                                     | `-`          | `https://api.dify.ai/v1` |
+| `TIMEOUT`              | 请求超时时间（秒）                                                                                                       | `30.0`       | `60.0` |
+| `SERVER_HOST`          | 代理服务监听主机                                                                                                         | `127.0.0.1`  | `0.0.0.0` |
+| `SERVER_PORT`          | 代理服务监听端口                                                                                                         | `8000`       | `8080` |
+| `CONVERSATION_MEMORY_MODE`| 对话记忆模式：<br>• `1` - 历史消息模式（将历史消息拼接到当前请求）<br>• `2` - conversation_id 模式（使用 Dify 的对话 ID 机制）  | `1`          | `2` |
+| `WORKERS`              | 生产模式下 uvicorn 的 worker 数量，用于支持多进程并发                                                                   | `1`          | `4` |
 
 ---
 
-## 📡 API 接口
+<div align="center">
 
-- **`POST /v1/chat/completions`** — 聊天补全接口（流式、非流式均支持）
-- **`GET /v1/models`** — 获取 Dify 应用映射到 OpenAI 模型 ID 的列表
+**⭐ 如果这个项目对你有帮助，请给我们一个 Star！⭐**
 
----
-
-## 📈 性能提示
-
-- **流式优化** —— 首包即发，降低用户等待延迟
-- **连接池复用** —— 启用 HTTP/2 提升高并发性能
-- **工具调用安全解析** —— 使用 Pydantic 确保 `tool_calls` 格式与 OpenAI 兼容
-- **缓存策略** —— TTL 缓存减少重复的 API 请求
-
----
-
-## 📜 许可
-MIT — 免费使用、修改和分发
+</div>

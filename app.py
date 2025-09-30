@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import re
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +38,10 @@ TTL_APP_CACHE = timedelta(minutes=30)
 
 # 简化零宽字符映射
 ZERO_WIDTH_CHARS = ['\u200b', '\u200c', '\u200d', '\ufeff']
+
+# 工具支持配置
+TOOL_SUPPORT = True
+SCAN_LIMIT = 8000  # 工具调用扫描限制
 
 
 class DifyModelManager:
@@ -202,36 +207,87 @@ def transform_openai_to_dify(openai_request: Dict, endpoint: str) -> Optional[Di
 
     messages = openai_request["messages"]
     stream = openai_request.get("stream", False)
+    tools = openai_request.get("tools", [])
+    tool_choice = openai_request.get("tool_choice", "auto")
+
+    # 处理工具注入到消息中
+    processed_messages = []
+    if tools and TOOL_SUPPORT and tool_choice != "none":
+        tools_prompt = generate_tool_prompt(tools)
+        has_system = any(m.get("role") == "system" for m in messages)
+
+        if has_system:
+            for m in messages:
+                if m.get("role") == "system":
+                    mm = dict(m)
+                    content = content_to_string(mm.get("content", ""))
+                    mm["content"] = content + tools_prompt
+                    processed_messages.append(mm)
+                else:
+                    processed_messages.append(m)
+        else:
+            processed_messages = [{"role": "system", "content": "你是一个有用的助手。" + tools_prompt}] + messages
+
+        # 添加工具选择提示
+        if tool_choice in ("required", "auto"):
+            if processed_messages and processed_messages[-1].get("role") == "user":
+                last = dict(processed_messages[-1])
+                content = content_to_string(last.get("content", ""))
+                last["content"] = content + "\n\n请根据需要使用提供的工具函数。"
+                processed_messages[-1] = last
+        elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            fname = (tool_choice.get("function") or {}).get("name")
+            if fname and processed_messages and processed_messages[-1].get("role") == "user":
+                last = dict(processed_messages[-1])
+                content = content_to_string(last.get("content", ""))
+                last["content"] = content + f"\n\n请使用 {fname} 函数来处理这个请求。"
+                processed_messages[-1] = last
+    else:
+        processed_messages = list(messages)
+
+    # 处理tool/function消息
+    final_messages = []
+    for m in processed_messages:
+        role = m.get("role")
+        if role in ("tool", "function"):
+            tool_name = m.get("name", "unknown")
+            tool_content = content_to_string(m.get("content", ""))
+            if isinstance(tool_content, dict):
+                tool_content = ujson.dumps(tool_content, ensure_ascii=False)
+
+            content = f"工具 {tool_name} 返回结果:\n```json\n{tool_content}\n```"
+            if not content.strip():
+                content = f"工具 {tool_name} 执行完成"
+
+            final_messages.append({
+                "role": "assistant",
+                "content": content,
+            })
+        else:
+            final_msg = dict(m)
+            content = content_to_string(final_msg.get("content", ""))
+            final_msg["content"] = content
+            final_messages.append(final_msg)
+
+    # 现在从处理后的消息中提取system和user query
     system_content = ""
     user_query = ""
 
     # 提取system消息
-    for m in messages:
+    for m in final_messages:
         if m.get("role") == "system":
             system_content = m.get("content", "")
             break
 
     # 处理最后一条用户消息
-    last_message = messages[-1]
+    last_message = final_messages[-1] if final_messages else {}
     if last_message.get("role") == "user":
-        content = last_message.get("content", "")
-        if isinstance(content, list):
-            # 多模态内容，只提取文本
-            user_query = " ".join(
-                part.get("text", "") for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
-        else:
-            user_query = content
-
-    # 处理工具调用
-    tools = openai_request.get("tools", [])
-    tool_choice = openai_request.get("tool_choice", "auto")
+        user_query = last_message.get("content", "")
 
     if CONVERSATION_MEMORY_MODE == 2:
         conversation_id = None
-        if len(messages) > 1:
-            for m in reversed(messages[:-1]):
+        if len(final_messages) > 1:
+            for m in reversed(final_messages[:-1]):
                 if m.get("role") == "assistant":
                     conversation_id = decode_conversation_id(m.get("content", ""))
                     if conversation_id:
@@ -249,10 +305,10 @@ def transform_openai_to_dify(openai_request: Dict, endpoint: str) -> Optional[Di
         }
     else:
         # history模式
-        if len(messages) > 1:
+        if len(final_messages) > 1:
             history_msg = []
-            has_system = any(m.get("role") == "system" for m in messages[:-1])
-            for m in messages[:-1]:
+            has_system = any(m.get("role") == "system" for m in final_messages[:-1])
+            for m in final_messages[:-1]:
                 role, content = m.get("role", ""), m.get("content", "")
                 if role and content:
                     history_msg.append(f"{role}: {content}")
@@ -273,41 +329,231 @@ def transform_openai_to_dify(openai_request: Dict, endpoint: str) -> Optional[Di
             "user": openai_request.get("user", "default_user")
         }
 
-    # 添加工具支持
-    if tools:
-        dify_request["tools"] = transform_tools_to_dify(tools, tool_choice)
-
     return dify_request
 
 
-def transform_tools_to_dify(tools: List[Dict], tool_choice: Union[str, Dict] = "auto") -> Dict:
-    """将OpenAI工具格式转换为Dify格式"""
-    dify_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.get("function", {}).get("name", ""),
-                "description": tool.get("function", {}).get("description", ""),
-                "parameters": tool.get("function", {}).get("parameters", {})
-            }
-        }
-        for tool in tools if tool.get("type") == "function"
-    ]
+def content_to_string(content: Any) -> str:
+    """将各种格式的content转换为字符串"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif isinstance(p, str):
+                parts.append(p)
+        return " ".join(parts)
+    return ""
 
-    result = {"tools": dify_tools}
 
-    # 处理tool_choice
-    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
-        result["tool_choice"] = {
-            "type": "function",
-            "function": {"name": tool_choice.get("function", {}).get("name", "")}
-        }
-    elif tool_choice == "none":
-        result["tool_choice"] = "none"
-    else:
-        result["tool_choice"] = "auto"
+def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
+    """生成工具注入提示"""
+    if not tools:
+        return ""
 
-    return result
+    tool_definitions = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+
+        function_spec = tool.get("function", {}) or {}
+        function_name = function_spec.get("name", "unknown")
+        function_description = function_spec.get("description", "")
+        parameters = function_spec.get("parameters", {}) or {}
+
+        tool_info = [f"## {function_name}", f"**Purpose**: {function_description}"]
+
+        parameter_properties = parameters.get("properties", {}) or {}
+        required_parameters = set(parameters.get("required", []) or [])
+
+        if parameter_properties:
+            tool_info.append("**Parameters**:")
+            for param_name, param_details in parameter_properties.items():
+                param_type = (param_details or {}).get("type", "any")
+                param_desc = (param_details or {}).get("description", "")
+                requirement_flag = "**Required**" if param_name in required_parameters else "*Optional*"
+                tool_info.append(f"- `{param_name}` ({param_type}) - {requirement_flag}: {param_desc}")
+
+        tool_definitions.append("\n".join(tool_info))
+
+    if not tool_definitions:
+        return ""
+
+    prompt_template = (
+        "\n\n# AVAILABLE FUNCTIONS\n" + "\n\n---\n".join(tool_definitions) + "\n\n# USAGE INSTRUCTIONS\n"
+        "When you need to execute a function, respond ONLY with a JSON object containing tool_calls:\n"
+        "```json\n"
+        "{\n"
+        '  "tool_calls": [\n'
+        "    {\n"
+        '      "id": "call_xxx",\n'
+        '      "type": "function",\n'
+        '      "function": {\n'
+        '        "name": "function_name",\n'
+        '        "arguments": "{\\"param1\\": \\"value1\\"}"\n'
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "```\n"
+        "Important: No explanatory text before or after the JSON. The 'arguments' field must be a JSON string, not an object.\n"
+    )
+
+    return prompt_template
+
+
+# 工具提取的正则模式
+TOOL_CALL_FENCE_PATTERN = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+FUNCTION_CALL_PATTERN = re.compile(r"调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})", re.DOTALL)
+
+
+def extract_tool_invocations(text: str) -> Optional[List[Dict[str, Any]]]:
+    """从响应文本中提取工具调用"""
+    if not text:
+        return None
+
+    scannable_text = text[:SCAN_LIMIT]
+
+    # 尝试1: 从JSON代码块提取
+    json_blocks = TOOL_CALL_FENCE_PATTERN.findall(scannable_text)
+    for json_block in json_blocks:
+        try:
+            parsed_data = ujson.loads(json_block)
+            tool_calls = parsed_data.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if "function" in tc:
+                        func = tc["function"]
+                        if "arguments" in func:
+                            if isinstance(func["arguments"], dict):
+                                func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
+                            elif not isinstance(func["arguments"], str):
+                                func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
+                return tool_calls
+        except (ujson.JSONDecodeError, AttributeError):
+            continue
+
+    # 尝试2: 使用括号平衡方法提取内联JSON
+    i = 0
+    while i < len(scannable_text):
+        if scannable_text[i] == '{':
+            brace_count = 1
+            j = i + 1
+            in_string = False
+            escape_next = False
+
+            while j < len(scannable_text) and brace_count > 0:
+                if escape_next:
+                    escape_next = False
+                elif scannable_text[j] == '\\':
+                    escape_next = True
+                elif scannable_text[j] == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if scannable_text[j] == '{':
+                        brace_count += 1
+                    elif scannable_text[j] == '}':
+                        brace_count -= 1
+                j += 1
+
+            if brace_count == 0:
+                json_str = scannable_text[i:j]
+                try:
+                    parsed_data = ujson.loads(json_str)
+                    tool_calls = parsed_data.get("tool_calls")
+                    if tool_calls and isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            if "function" in tc:
+                                func = tc["function"]
+                                if "arguments" in func:
+                                    if isinstance(func["arguments"], dict):
+                                        func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
+                                    elif not isinstance(func["arguments"], str):
+                                        func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
+                        return tool_calls
+                except (ujson.JSONDecodeError, AttributeError):
+                    pass
+
+            i += 1
+        else:
+            i += 1
+
+    # 尝试3: 解析自然语言函数调用
+    natural_lang_match = FUNCTION_CALL_PATTERN.search(scannable_text)
+    if natural_lang_match:
+        function_name = natural_lang_match.group(1).strip()
+        arguments_str = natural_lang_match.group(2).strip()
+        try:
+            ujson.loads(arguments_str)
+            return [
+                {
+                    "id": f"call_{int(time.time() * 1000000)}",
+                    "type": "function",
+                    "function": {"name": function_name, "arguments": arguments_str},
+                }
+            ]
+        except ujson.JSONDecodeError:
+            return None
+
+    return None
+
+
+def remove_tool_json_content(text: str) -> str:
+    """从响应文本中移除工具JSON内容"""
+    def remove_tool_call_block(match: re.Match) -> str:
+        json_content = match.group(1)
+        try:
+            parsed_data = ujson.loads(json_content)
+            if "tool_calls" in parsed_data:
+                return ""
+        except (ujson.JSONDecodeError, AttributeError):
+            pass
+        return match.group(0)
+
+    cleaned_text = TOOL_CALL_FENCE_PATTERN.sub(remove_tool_call_block, text)
+
+    # 移除内联工具JSON
+    result = []
+    i = 0
+    while i < len(cleaned_text):
+        if cleaned_text[i] == '{':
+            brace_count = 1
+            j = i + 1
+            in_string = False
+            escape_next = False
+
+            while j < len(cleaned_text) and brace_count > 0:
+                if escape_next:
+                    escape_next = False
+                elif cleaned_text[j] == '\\':
+                    escape_next = True
+                elif cleaned_text[j] == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if cleaned_text[j] == '{':
+                        brace_count += 1
+                    elif cleaned_text[j] == '}':
+                        brace_count -= 1
+                j += 1
+
+            if brace_count == 0:
+                json_str = cleaned_text[i:j]
+                try:
+                    parsed = ujson.loads(json_str)
+                    if "tool_calls" in parsed:
+                        i = j
+                        continue
+                except:
+                    pass
+
+            result.append(cleaned_text[i])
+            i += 1
+        else:
+            result.append(cleaned_text[i])
+            i += 1
+
+    return ''.join(result).strip()
 
 
 def stream_transform(dify_response: Dict, model: str, stream: bool) -> Dict:
@@ -317,8 +563,16 @@ def stream_transform(dify_response: Dict, model: str, stream: bool) -> Dict:
     answer = dify_response.get("answer", "")
     tool_calls = []
 
-    # 处理工具调用
-    if "tool_calls" in dify_response:
+    # 先尝试从answer中提取工具调用
+    if answer and TOOL_SUPPORT:
+        extracted_tools = extract_tool_invocations(answer)
+        if extracted_tools:
+            tool_calls = extracted_tools
+            # 从answer中移除工具JSON
+            answer = remove_tool_json_content(answer)
+
+    # 如果Dify响应中包含tool_calls（原生支持）
+    if "tool_calls" in dify_response and not tool_calls:
         tool_calls = [
             {
                 "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
@@ -354,7 +608,7 @@ def stream_transform(dify_response: Dict, model: str, stream: bool) -> Dict:
                 answer += encode_conversation_id(conversation_id)
 
     # 构建响应
-    message_content = {"role": "assistant", "content": answer}
+    message_content = {"role": "assistant", "content": answer if not tool_calls else None}
     if tool_calls:
         message_content["tool_calls"] = tool_calls
 
@@ -379,7 +633,12 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
     endpoint = f"{DIFY_API_BASE}/chat-messages"
     message_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
-    def make_chunk(content: str = "", tool_calls: List[Dict] = None, final=False):
+    # 用于累积内容以检测工具调用
+    accumulated_content = ""
+    detected_tools = []
+    tool_calls_sent = False
+
+    def make_chunk(content: str = "", tool_calls: List[Dict] = None, final=False, role: str = None):
         chunk = {
             "id": message_id,
             "object": "chat.completion.chunk",
@@ -392,12 +651,14 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
             }]
         }
 
+        if role:
+            chunk["choices"][0]["delta"]["role"] = role
         if content:
             chunk["choices"][0]["delta"]["content"] = content
         if tool_calls:
             chunk["choices"][0]["delta"]["tool_calls"] = tool_calls
         if final:
-            chunk["choices"][0]["finish_reason"] = "tool_calls" if tool_calls else "stop"
+            chunk["choices"][0]["finish_reason"] = "tool_calls" if tool_calls or tool_calls_sent else "stop"
 
         return f"data: {ujson.dumps(chunk)}\n\n"
 
@@ -407,6 +668,7 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
             yield "data: [DONE]\n\n"
             return
 
+        first_chunk = True
         buffer = b""
         async for chunk in rsp.aiter_bytes(8192):
             buffer += chunk
@@ -425,16 +687,48 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
                     if event_type in ("message", "agent_message"):
                         answer = data.get("answer", "")
                         if answer:
-                            yield make_chunk(answer)
+                            accumulated_content += answer
+
+                            # 尝试检测工具调用
+                            if TOOL_SUPPORT and not tool_calls_sent:
+                                extracted = extract_tool_invocations(accumulated_content)
+                                if extracted:
+                                    # 检测到工具调用
+                                    detected_tools = extracted
+                                    tool_calls_sent = True
+
+                                    # 发送角色
+                                    if first_chunk:
+                                        yield make_chunk(role="assistant")
+                                        first_chunk = False
+
+                                    # 发送工具调用
+                                    yield make_chunk(tool_calls=detected_tools)
+                                    continue
+
+                            # 正常内容流式输出
+                            if not tool_calls_sent:
+                                if first_chunk:
+                                    yield make_chunk(content=answer, role="assistant")
+                                    first_chunk = False
+                                else:
+                                    yield make_chunk(answer)
 
                     elif event_type == "agent_thought":
                         thought = data.get("thought", "")
-                        if thought:
-                            yield make_chunk(thought)
+                        if thought and not tool_calls_sent:
+                            accumulated_content += thought
+                            if first_chunk:
+                                yield make_chunk(content=thought, role="assistant")
+                                first_chunk = False
+                            else:
+                                yield make_chunk(thought)
 
                     elif event_type == "tool_calls":
+                        # Dify原生工具调用支持
                         tool_calls = data.get("tool_calls", [])
                         if tool_calls:
+                            tool_calls_sent = True
                             openai_tools = [
                                 {
                                     "id": tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
@@ -446,14 +740,28 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
                                 }
                                 for tc in tool_calls
                             ]
+                            if first_chunk:
+                                yield make_chunk(role="assistant")
+                                first_chunk = False
                             yield make_chunk(tool_calls=openai_tools)
 
                     elif event_type == "message_end":
+                        # 最后检查一次是否有工具调用
+                        if TOOL_SUPPORT and not tool_calls_sent and accumulated_content:
+                            extracted = extract_tool_invocations(accumulated_content)
+                            if extracted:
+                                detected_tools = extracted
+                                tool_calls_sent = True
+                                if first_chunk:
+                                    yield make_chunk(role="assistant")
+                                yield make_chunk(tool_calls=detected_tools)
+
                         yield make_chunk("", final=True)
                         yield "data: [DONE]\n\n"
                         return
 
-                except:
+                except Exception as e:
+                    logger.error(f"Stream processing error: {e}")
                     continue
 
         yield make_chunk("", final=True)

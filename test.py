@@ -9,7 +9,7 @@ client = OpenAI(
 
 # 使用新的API调用方式
 response = client.chat.completions.create(
-    model="AgentCoder",  # 使用 Dify 应用的名称
+    model="ChatCoder",  # 使用 Dify 应用的名称
     messages=[
         {"role": "user", "content": "你好"}
     ],

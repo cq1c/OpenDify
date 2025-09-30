@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 VALID_API_KEYS = [key.strip() for key in os.getenv("VALID_API_KEYS", "").split(",") if key]
+VALID_API_KEYS_SET = frozenset(VALID_API_KEYS)  # 使用set加速查找，O(1)
 CONVERSATION_MEMORY_MODE = int(os.getenv('CONVERSATION_MEMORY_MODE', '1'))
 DIFY_API_BASE = os.getenv("DIFY_API_BASE", "")
 TIMEOUT = float(os.getenv("TIMEOUT", 30.0))
@@ -38,10 +39,25 @@ TTL_APP_CACHE = timedelta(minutes=30)
 
 # 简化零宽字符映射
 ZERO_WIDTH_CHARS = ['\u200b', '\u200c', '\u200d', '\ufeff']
+ZERO_WIDTH_CHARS_SET = frozenset(ZERO_WIDTH_CHARS)  # 使用set加速查找
 
 # 工具支持配置
 TOOL_SUPPORT = True
 SCAN_LIMIT = 8000  # 工具调用扫描限制
+
+# 预计算的常量字符串，避免重复拼接
+SYSTEM_DEFAULT_PROMPT = "你是一个有用的助手。"
+TOOL_USE_HINT = "\n\n请根据需要使用提供的工具函数。"
+TOOL_RESULT_PREFIX = "工具 "
+TOOL_RESULT_SUFFIX = " 返回结果:\n```json\n"
+TOOL_RESULT_END = "\n```"
+TOOL_COMPLETE_SUFFIX = " 执行完成"
+
+# 预编译的UUID格式，避免重复字符串操作
+import secrets
+def fast_uuid() -> str:
+    """快速生成UUID hex（比uuid.uuid4().hex更快）"""
+    return secrets.token_hex(16)
 
 
 class DifyModelManager:
@@ -140,31 +156,29 @@ app.add_middleware(
 # 简化的零宽字符编码
 @lru_cache(maxsize=256)
 def encode_conversation_id(conversation_id: str) -> str:
-    """简化的conversation_id编码"""
+    """简化的conversation_id编码（优化版本）"""
     if not conversation_id:
         return ""
 
     # 使用简单的base64编码 + 零宽字符
     encoded = base64.b64encode(conversation_id.encode('utf-8')).decode('ascii')
-    # 用零宽字符替换部分字符使其不可见
-    result = ""
+    # 用零宽字符替换部分字符使其不可见 - 使用列表拼接优化
+    result = []
+    zero_width_len = len(ZERO_WIDTH_CHARS)
     for i, char in enumerate(encoded):
         if i % 4 == 0:  # 每4个字符插入一个零宽字符
-            result += ZERO_WIDTH_CHARS[i % len(ZERO_WIDTH_CHARS)]
-        result += char
-    return result
+            result.append(ZERO_WIDTH_CHARS[i % zero_width_len])
+        result.append(char)
+    return ''.join(result)
 
 def decode_conversation_id(content: str) -> Optional[str]:
-    """简化的conversation_id解码"""
+    """简化的conversation_id解码（优化版本）"""
     if not content:
         return None
 
     try:
-        # 移除零宽字符
-        cleaned = ""
-        for char in content:
-            if char not in ZERO_WIDTH_CHARS:
-                cleaned += char
+        # 移除零宽字符 - 使用列表推导式和join优化
+        cleaned = ''.join(char for char in content if char not in ZERO_WIDTH_CHARS_SET)
 
         # 反向查找base64字符串
         for i in range(len(cleaned) - 4, -1, -1):
@@ -195,7 +209,7 @@ async def verify_api_key(request: Request) -> str:
         raise HTTPUnauthorized("Invalid Authorization header")
 
     key = auth_header[7:]
-    if not key or key not in VALID_API_KEYS:
+    if not key or key not in VALID_API_KEYS_SET:  # 使用set加速验证
         raise HTTPUnauthorized("Invalid API key")
     return key
 
@@ -214,26 +228,29 @@ def transform_openai_to_dify(openai_request: Dict, endpoint: str) -> Optional[Di
     processed_messages = []
     if tools and TOOL_SUPPORT and tool_choice != "none":
         tools_prompt = generate_tool_prompt(tools)
-        has_system = any(m.get("role") == "system" for m in messages)
+        has_system = False
 
-        if has_system:
-            for m in messages:
-                if m.get("role") == "system":
-                    mm = dict(m)
-                    content = content_to_string(mm.get("content", ""))
-                    mm["content"] = content + tools_prompt
-                    processed_messages.append(mm)
-                else:
-                    processed_messages.append(m)
-        else:
-            processed_messages = [{"role": "system", "content": "你是一个有用的助手。" + tools_prompt}] + messages
+        # 一次遍历同时检查和处理
+        for m in messages:
+            if m.get("role") == "system":
+                has_system = True
+                mm = dict(m)
+                content = content_to_string(mm.get("content", ""))
+                mm["content"] = content + tools_prompt
+                processed_messages.append(mm)
+            else:
+                processed_messages.append(m)
+
+        # 如果没有system消息，在开头添加
+        if not has_system:
+            processed_messages.insert(0, {"role": "system", "content": SYSTEM_DEFAULT_PROMPT + tools_prompt})
 
         # 添加工具选择提示
         if tool_choice in ("required", "auto"):
             if processed_messages and processed_messages[-1].get("role") == "user":
                 last = dict(processed_messages[-1])
                 content = content_to_string(last.get("content", ""))
-                last["content"] = content + "\n\n请根据需要使用提供的工具函数。"
+                last["content"] = content + TOOL_USE_HINT
                 processed_messages[-1] = last
         elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
             fname = (tool_choice.get("function") or {}).get("name")
@@ -255,9 +272,11 @@ def transform_openai_to_dify(openai_request: Dict, endpoint: str) -> Optional[Di
             if isinstance(tool_content, dict):
                 tool_content = ujson.dumps(tool_content, ensure_ascii=False)
 
-            content = f"工具 {tool_name} 返回结果:\n```json\n{tool_content}\n```"
-            if not content.strip():
-                content = f"工具 {tool_name} 执行完成"
+            # 使用预计算的常量字符串
+            if tool_content.strip():
+                content = TOOL_RESULT_PREFIX + tool_name + TOOL_RESULT_SUFFIX + tool_content + TOOL_RESULT_END
+            else:
+                content = TOOL_RESULT_PREFIX + tool_name + TOOL_COMPLETE_SUFFIX
 
             final_messages.append({
                 "role": "assistant",
@@ -286,6 +305,7 @@ def transform_openai_to_dify(openai_request: Dict, endpoint: str) -> Optional[Di
 
     if CONVERSATION_MEMORY_MODE == 2:
         conversation_id = None
+        # 反向查找assistant消息，提前退出
         if len(final_messages) > 1:
             for m in reversed(final_messages[:-1]):
                 if m.get("role") == "assistant":
@@ -572,7 +592,7 @@ def stream_transform(dify_response: Dict, model: str, stream: bool) -> Dict:
     if "tool_calls" in dify_response and not tool_calls:
         tool_calls = [
             {
-                "id": tc.get("id", f"call_{uuid.uuid4().hex}"),
+                "id": tc.get("id", f"call_{fast_uuid()}"),
                 "type": "function",
                 "function": {
                     "name": tc.get("function", {}).get("name", ""),
@@ -628,7 +648,7 @@ def stream_transform(dify_response: Dict, model: str, stream: bool) -> Dict:
 async def stream_response(dify_request: Dict, api_key: str, model: str) -> AsyncGenerator[str, None]:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     endpoint = f"{DIFY_API_BASE}/chat-messages"
-    message_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    message_id = f"chatcmpl-{fast_uuid()[:8]}"  # 使用更快的UUID生成
 
     # 用于累积内容以检测工具调用
     accumulated_content = ""
@@ -667,13 +687,14 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
             return
 
         first_chunk = True
-        buffer = b""
+        buffer = bytearray()  # 使用bytearray代替bytes，避免重复分配
         async for chunk in rsp.aiter_bytes(8192):
-            buffer += chunk
+            buffer.extend(chunk)
 
             while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                line = line.strip()
+                idx = buffer.find(b"\n")
+                line = bytes(buffer[:idx]).strip()
+                buffer = buffer[idx+1:]
 
                 if not line.startswith(b"data: "):
                     continue
@@ -734,7 +755,7 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
                             tool_calls_sent = True
                             openai_tools = [
                                 {
-                                    "id": tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                                    "id": tc.get("id", f"call_{fast_uuid()[:8]}"),
                                     "type": "function",
                                     "function": {
                                         "name": tc.get("function", {}).get("name", ""),

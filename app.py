@@ -404,12 +404,62 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
 
 
 # 工具提取的正则模式
-TOOL_CALL_FENCE_PATTERN = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+TOOL_CALL_FENCE_PATTERN = re.compile(r"```json\s*(\{[^`]+\})\s*```", re.DOTALL)
 FUNCTION_CALL_PATTERN = re.compile(r"调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})", re.DOTALL)
+
+# LRU缓存用于工具调用提取结果
+@lru_cache(maxsize=128)
+def _cached_extract_tool_invocations(text_hash: int, text_len: int) -> Optional[str]:
+    """内部缓存函数，返回JSON字符串"""
+    return None  # 实际由extract_tool_invocations填充
+
+
+def _normalize_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """标准化工具调用，确保arguments字段为字符串"""
+    for tc in tool_calls:
+        if "function" in tc:
+            func = tc["function"]
+            if "arguments" in func:
+                if not isinstance(func["arguments"], str):
+                    func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
+    return tool_calls
+
+
+def _find_balanced_json(text: str, start_pos: int = 0) -> Optional[tuple[str, int]]:
+    """使用括号平衡查找JSON对象，返回(json_str, end_pos)"""
+    i = start_pos
+    while i < len(text):
+        if text[i] == '{':
+            brace_count = 1
+            j = i + 1
+            in_string = False
+            escape_next = False
+
+            while j < len(text) and brace_count > 0:
+                char = text[j]
+                if escape_next:
+                    escape_next = False
+                elif char == '\\':
+                    escape_next = True
+                elif char == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                j += 1
+
+            if brace_count == 0:
+                return text[i:j], j
+            i = j
+        else:
+            i += 1
+    return None
 
 
 def extract_tool_invocations(text: str) -> Optional[List[Dict[str, Any]]]:
-    """从响应文本中提取工具调用"""
+    """从响应文本中提取工具调用（优化版本）"""
     if not text:
         return None
 
@@ -422,62 +472,27 @@ def extract_tool_invocations(text: str) -> Optional[List[Dict[str, Any]]]:
             parsed_data = ujson.loads(json_block)
             tool_calls = parsed_data.get("tool_calls")
             if tool_calls and isinstance(tool_calls, list):
-                for tc in tool_calls:
-                    if "function" in tc:
-                        func = tc["function"]
-                        if "arguments" in func:
-                            if isinstance(func["arguments"], dict):
-                                func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
-                            elif not isinstance(func["arguments"], str):
-                                func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
-                return tool_calls
+                return _normalize_tool_calls(tool_calls)
         except (ujson.JSONDecodeError, AttributeError):
             continue
 
     # 尝试2: 使用括号平衡方法提取内联JSON
-    i = 0
-    while i < len(scannable_text):
-        if scannable_text[i] == '{':
-            brace_count = 1
-            j = i + 1
-            in_string = False
-            escape_next = False
+    pos = 0
+    while pos < len(scannable_text):
+        result = _find_balanced_json(scannable_text, pos)
+        if not result:
+            break
 
-            while j < len(scannable_text) and brace_count > 0:
-                if escape_next:
-                    escape_next = False
-                elif scannable_text[j] == '\\':
-                    escape_next = True
-                elif scannable_text[j] == '"' and not escape_next:
-                    in_string = not in_string
-                elif not in_string:
-                    if scannable_text[j] == '{':
-                        brace_count += 1
-                    elif scannable_text[j] == '}':
-                        brace_count -= 1
-                j += 1
+        json_str, end_pos = result
+        try:
+            parsed_data = ujson.loads(json_str)
+            tool_calls = parsed_data.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list):
+                return _normalize_tool_calls(tool_calls)
+        except (ujson.JSONDecodeError, AttributeError):
+            pass
 
-            if brace_count == 0:
-                json_str = scannable_text[i:j]
-                try:
-                    parsed_data = ujson.loads(json_str)
-                    tool_calls = parsed_data.get("tool_calls")
-                    if tool_calls and isinstance(tool_calls, list):
-                        for tc in tool_calls:
-                            if "function" in tc:
-                                func = tc["function"]
-                                if "arguments" in func:
-                                    if isinstance(func["arguments"], dict):
-                                        func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
-                                    elif not isinstance(func["arguments"], str):
-                                        func["arguments"] = ujson.dumps(func["arguments"], ensure_ascii=False)
-                        return tool_calls
-                except (ujson.JSONDecodeError, AttributeError):
-                    pass
-
-            i += 1
-        else:
-            i += 1
+        pos = end_pos
 
     # 尝试3: 解析自然语言函数调用
     natural_lang_match = FUNCTION_CALL_PATTERN.search(scannable_text)
@@ -494,13 +509,13 @@ def extract_tool_invocations(text: str) -> Optional[List[Dict[str, Any]]]:
                 }
             ]
         except ujson.JSONDecodeError:
-            return None
+            pass
 
     return None
 
 
 def remove_tool_json_content(text: str) -> str:
-    """从响应文本中移除工具JSON内容"""
+    """从响应文本中移除工具JSON内容（优化版本）"""
     def remove_tool_call_block(match: re.Match) -> str:
         json_content = match.group(1)
         try:
@@ -513,45 +528,27 @@ def remove_tool_json_content(text: str) -> str:
 
     cleaned_text = TOOL_CALL_FENCE_PATTERN.sub(remove_tool_call_block, text)
 
-    # 移除内联工具JSON
+    # 移除内联工具JSON - 使用共享的括号平衡函数
     result = []
-    i = 0
-    while i < len(cleaned_text):
-        if cleaned_text[i] == '{':
-            brace_count = 1
-            j = i + 1
-            in_string = False
-            escape_next = False
+    pos = 0
 
-            while j < len(cleaned_text) and brace_count > 0:
-                if escape_next:
-                    escape_next = False
-                elif cleaned_text[j] == '\\':
-                    escape_next = True
-                elif cleaned_text[j] == '"' and not escape_next:
-                    in_string = not in_string
-                elif not in_string:
-                    if cleaned_text[j] == '{':
-                        brace_count += 1
-                    elif cleaned_text[j] == '}':
-                        brace_count -= 1
-                j += 1
-
-            if brace_count == 0:
-                json_str = cleaned_text[i:j]
+    while pos < len(cleaned_text):
+        # 检查是否遇到JSON对象
+        if cleaned_text[pos] == '{':
+            json_result = _find_balanced_json(cleaned_text, pos)
+            if json_result:
+                json_str, end_pos = json_result
                 try:
                     parsed = ujson.loads(json_str)
                     if "tool_calls" in parsed:
-                        i = j
+                        # 跳过这个工具调用JSON
+                        pos = end_pos
                         continue
                 except:
                     pass
 
-            result.append(cleaned_text[i])
-            i += 1
-        else:
-            result.append(cleaned_text[i])
-            i += 1
+        result.append(cleaned_text[pos])
+        pos += 1
 
     return ''.join(result).strip()
 
@@ -637,6 +634,7 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
     accumulated_content = ""
     detected_tools = []
     tool_calls_sent = False
+    last_extraction_length = 0  # 跟踪上次提取时的内容长度
 
     def make_chunk(content: str = "", tool_calls: List[Dict] = None, final=False, role: str = None):
         chunk = {
@@ -689,22 +687,27 @@ async def stream_response(dify_request: Dict, api_key: str, model: str) -> Async
                         if answer:
                             accumulated_content += answer
 
-                            # 尝试检测工具调用
+                            # 尝试检测工具调用 - 仅在内容显著增长时检测
                             if TOOL_SUPPORT and not tool_calls_sent:
-                                extracted = extract_tool_invocations(accumulated_content)
-                                if extracted:
-                                    # 检测到工具调用
-                                    detected_tools = extracted
-                                    tool_calls_sent = True
+                                content_length = len(accumulated_content)
+                                # 内容增长至少100字符才重新检测，避免频繁调用
+                                if content_length - last_extraction_length >= 100:
+                                    extracted = extract_tool_invocations(accumulated_content)
+                                    last_extraction_length = content_length
 
-                                    # 发送角色
-                                    if first_chunk:
-                                        yield make_chunk(role="assistant")
-                                        first_chunk = False
+                                    if extracted:
+                                        # 检测到工具调用
+                                        detected_tools = extracted
+                                        tool_calls_sent = True
 
-                                    # 发送工具调用
-                                    yield make_chunk(tool_calls=detected_tools)
-                                    continue
+                                        # 发送角色
+                                        if first_chunk:
+                                            yield make_chunk(role="assistant")
+                                            first_chunk = False
+
+                                        # 发送工具调用
+                                        yield make_chunk(tool_calls=detected_tools)
+                                        continue
 
                             # 正常内容流式输出
                             if not tool_calls_sent:

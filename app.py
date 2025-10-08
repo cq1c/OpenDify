@@ -413,14 +413,27 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
                 if param_desc:
                     tool_info.append(f"    → {param_desc}")
 
+                # 针对路径类参数添加特别提示
+                if 'path' in param_name.lower() and 'absolute' in param_name.lower():
+                    tool_info.append(f"    ⚠️  MUST be COMPLETE absolute path (e.g., C:/Users/name/project/file.py)")
+                    tool_info.append(f"    ⚠️  NEVER use relative paths or partial paths")
+
                 # 对于 object 类型，显示其内部结构
                 if param_type == "object":
                     obj_props = (param_details or {}).get("properties", {})
+                    obj_required = set((param_details or {}).get("required", []) or [])
                     if obj_props:
                         tool_info.append(f"    Object structure:")
                         for obj_key, obj_val in obj_props.items():
                             obj_type = (obj_val or {}).get("type", "any")
-                            tool_info.append(f"      - {obj_key}: {obj_type}")
+                            obj_desc = (obj_val or {}).get("description", "")
+                            obj_req = "[REQ]" if obj_key in obj_required else "[OPT]"
+                            tool_info.append(f"      - {obj_req} {obj_key}: {obj_type}")
+                            if obj_desc:
+                                tool_info.append(f"        → {obj_desc}")
+                            # 特殊处理id字段
+                            if obj_key == "id":
+                                tool_info.append(f"        ⚠️  MUST be a unique non-empty string")
 
                 # 对于 array 类型，显示元素类型
                 elif param_type == "array":
@@ -428,9 +441,14 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
                     if items_schema:
                         items_type = items_schema.get("type", "any")
                         tool_info.append(f"    Array of: {items_type}")
+                        # 如果数组元素是object且包含id字段
+                        if items_type == "object":
+                            items_props = items_schema.get("properties", {})
+                            if "id" in items_props:
+                                tool_info.append(f"    ⚠️  Each object MUST have a unique non-empty 'id' field")
 
         # 为每个工具生成具体示例
-        def generate_example_value(param_details, depth=0):
+        def generate_example_value(param_details, param_name="", depth=0):
             """递归生成示例值"""
             if depth > 3:  # 防止无限递归
                 return {}
@@ -438,6 +456,11 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
             param_type = (param_details or {}).get("type", "string")
 
             if param_type == "string":
+                # 针对特定参数名生成更合适的示例
+                if 'path' in param_name.lower() and 'absolute' in param_name.lower():
+                    return "C:/Users/username/project/file.py"
+                elif param_name.lower() == "id":
+                    return f"unique_id_{secrets.token_hex(4)}"
                 return "example_string"
             elif param_type == "number":
                 return 42
@@ -448,14 +471,14 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
             elif param_type == "array":
                 items_schema = (param_details or {}).get("items", {})
                 if items_schema:
-                    return [generate_example_value(items_schema, depth + 1)]
+                    return [generate_example_value(items_schema, "", depth + 1)]
                 return ["item1", "item2"]
             elif param_type == "object":
                 properties = (param_details or {}).get("properties", {})
                 if properties:
                     obj = {}
                     for prop_name, prop_details in properties.items():
-                        obj[prop_name] = generate_example_value(prop_details, depth + 1)
+                        obj[prop_name] = generate_example_value(prop_details, prop_name, depth + 1)
                     return obj
                 return {"key": "value"}
             else:
@@ -463,7 +486,7 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
 
         example_args = {}
         for param_name, param_details in parameter_properties.items():
-            example_args[param_name] = generate_example_value(param_details)
+            example_args[param_name] = generate_example_value(param_details, param_name)
 
         if example_args:
             # 生成 JSON 字符串，需要转义引号
@@ -502,6 +525,8 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
         "4. The 'arguments' field MUST be a JSON STRING (with escaped quotes), NOT a JSON object\n"
         "5. Response format: ONLY output the JSON block, NO explanatory text before or after\n"
         "6. Each tool call needs a unique 'id' like 'call_functionname_1'\n"
+        "7. For absolute_path parameters: ALWAYS use COMPLETE paths (e.g., C:/full/path/to/file)\n"
+        "8. For objects with 'id' field: ALWAYS provide a unique non-empty string for each 'id'\n"
         "</CRITICAL_RULES>\n\n"
         "<RESPONSE_FORMAT>\n"
         "```json\n"

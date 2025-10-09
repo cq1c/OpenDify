@@ -1,20 +1,41 @@
 # OpenDify
 
-**🚀 高性能 Dify-to-OpenAI 代理服务**
+**🚀 将 Dify 转换为标准 OpenAI API 的高性能代理服务**
 
-将 [Dify](https://dify.ai) API 转换为 OpenAI 兼容格式，支持流式响应、工具调用、多模型管理。
+将 [Dify](https://dify.ai) 应用完美转换为 OpenAI 兼容接口，让你可以像调用 OpenAI API 一样使用 Dify！
 
-## 核心特性
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-- ✅ **完整 OpenAI API 兼容**：`/v1/chat/completions` 和 `/v1/models`
-- ✅ **高准确率工具调用**：精确的参数提示、自动类型推断、完整性验证
-- ✅ **流式响应**：SSE 流式输出，性能极致优化
-- ✅ **对话记忆**：支持历史消息模式和零宽字符编码的 Conversation ID 模式
-- ✅ **高性能**：HTTP/2 连接池、智能缓存、多重优化
+## ✨ 核心特性
 
-## 快速开始
+### 🎯 完全符合 OpenAI API 标准
+- ✅ **标准接口**：`/v1/chat/completions` 和 `/v1/models`
+- ✅ **无缝兼容**：直接使用官方 OpenAI SDK，无需修改代码
+- ✅ **标准格式**：请求/响应格式 100% 符合 OpenAI 规范
+- ✅ **错误处理**：标准的 OpenAI 错误格式
 
-### 安装
+### 🛠️ 完整的 Tool Calls 支持
+- ✅ **标准格式**：`tool_calls` 和 `tool` 消息完全符合规范
+- ✅ **参数验证**：`arguments` 字段正确为 JSON 字符串
+- ✅ **多轮对话**：支持工具调用的完整流程
+- ✅ **自动提取**：智能从模型响应中提取工具调用
+
+### 🌊 高性能流式响应
+- ✅ **SSE 标准**：Server-Sent Events 格式完全标准
+- ✅ **增量更新**：正确的 `delta` 增量格式
+- ✅ **工具流式**：支持流式返回工具调用
+- ✅ **性能优化**：HTTP/2、连接池、智能缓存
+
+### 💬 灵活的对话管理
+- ✅ **无状态设计**：客户端维护对话历史（OpenAI 标准）
+- ✅ **对话上下文**：可选的 Dify conversation_id 支持
+- ✅ **多模型管理**：自动映射 Dify 应用名到模型
+
+## 🚀 快速开始
+
+### 安装依赖
+
 ```bash
 # 克隆项目
 git clone https://github.com/realnghon/OpenDify.git
@@ -22,84 +43,221 @@ cd OpenDify
 
 # 安装依赖
 pip install -r requirements.txt
+```
 
-# 配置 .env 文件
-VALID_API_KEYS=sk-your-key
-DIFY_API_KEYS=app-your-dify-key
+### 配置环境变量
+
+创建 `.env` 文件：
+
+```bash
+# 代理服务的 API 密钥（可设置多个，逗号分隔）
+VALID_API_KEYS=sk-your-secret-key-1,sk-your-secret-key-2
+
+# Dify 应用的 API 密钥（可设置多个应用）
+DIFY_API_KEYS=app-xxx,app-yyy,app-zzz
+
+# Dify API 基础 URL
 DIFY_API_BASE=https://api.dify.ai/v1
 
-# 启动服务
+# 服务器配置（可选）
+SERVER_HOST=127.0.0.1
+SERVER_PORT=8000
+WORKERS=1
+
+# 超时设置（可选）
+TIMEOUT=30.0
+```
+
+### 启动服务
+
+```bash
 python app.py
 ```
 
-### 配置说明
+服务将在 `http://127.0.0.1:8000` 启动。
 
-| 环境变量 | 说明 | 默认值 |
-|---------|------|-------|
-| `VALID_API_KEYS` | 代理 API 密钥（逗号分隔） | - |
-| `DIFY_API_KEYS` | Dify 应用密钥（逗号分隔） | - |
-| `DIFY_API_BASE` | Dify API 基础 URL | - |
-| `CONVERSATION_MEMORY_MODE` | `1`=历史消息 `2`=零宽字符编码 | `1` |
-| `SERVER_PORT` | 监听端口 | `8000` |
-| `WORKERS` | Worker 进程数 | `1` |
+## 🔧 配置说明
 
-## 使用示例
+### 环境变量
 
-### Python
-```python
-from openai import OpenAI
+| 变量名 | 说明 | 必需 | 默认值 |
+|--------|------|------|--------|
+| `VALID_API_KEYS` | 代理服务的 API 密钥（逗号分隔） | ✅ | - |
+| `DIFY_API_KEYS` | Dify 应用 API 密钥（逗号分隔） | ✅ | - |
+| `DIFY_API_BASE` | Dify API 基础 URL | ✅ | - |
+| `SERVER_HOST` | 服务器监听地址 | ❌ | `127.0.0.1` |
+| `SERVER_PORT` | 服务器监听端口 | ❌ | `8000` |
+| `WORKERS` | Worker 进程数 | ❌ | `1` |
+| `TIMEOUT` | 请求超时时间（秒） | ❌ | `30.0` |
 
-client = OpenAI(api_key="sk-your-key", base_url="http://127.0.0.1:8000/v1")
+### 模型映射
 
-# 流式调用
-stream = client.chat.completions.create(
-    model="your-dify-app-name",
-    messages=[{"role": "user", "content": "Hello"}],
-    stream=True
-)
+代理服务会自动从 Dify 获取应用名称并映射为模型：
 
-# 工具调用
-response = client.chat.completions.create(
-    model="your-dify-app-name",
-    messages=[{"role": "user", "content": "北京天气"}],
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
-        }
-    }]
-)
+1. 启动时自动调用 Dify `/info` 接口
+2. 获取每个应用的名称
+3. 在 `/v1/models` 接口中列出
+4. 使用应用名称作为 `model` 参数
+
+示例：
+- Dify 应用名：`ChatGPT-Assistant`
+- 调用时使用：`model="ChatGPT-Assistant"`
+
+## 📋 API 端点
+
+### POST /v1/chat/completions
+
+标准的 OpenAI Chat Completions 接口。
+
+**请求参数：**
+- `model` (string, 必需): Dify 应用名称
+- `messages` (array, 必需): 对话消息数组
+- `stream` (boolean, 可选): 是否流式响应，默认 `false`
+- `tools` (array, 可选): 工具定义数组
+- `tool_choice` (string|object, 可选): 工具选择策略
+- `user` (string, 可选): 用户标识
+
+**响应格式：**
+
+非流式：
+```json
+{
+  "id": "chatcmpl-xxx",
+  "object": "chat.completion",
+  "created": 1234567890,
+  "model": "your-dify-app-name",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "Hello! How can I help you?"
+    },
+    "finish_reason": "stop",
+    "logprobs": null
+  }],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 20,
+    "total_tokens": 30
+  }
+}
 ```
 
-### cURL
+流式（SSE）：
+```
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"your-model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"your-model","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"your-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+### GET /v1/models
+
+获取可用模型列表。
+
+**响应格式：**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "ChatGPT-Assistant",
+      "object": "model",
+      "created": 1234567890,
+      "owned_by": "dify"
+    }
+  ]
+}
+```
+
+## 🧪 测试
+
+项目包含完整的测试套件：
+
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-your-key" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "your-app", "messages": [{"role": "user", "content": "Hi"}]}'
+# 运行标准兼容性测试
+python test_openai_standard.py
 ```
 
-## 工具调用优化
+测试覆盖：
+- ✅ 基础对话
+- ✅ 多轮对话
+- ✅ 工具调用
+- ✅ 多轮对话 + 工具调用
+- ✅ 流式响应
 
-### 高准确率设计
-- ✅ **精确参数提示**：每个工具生成具体示例，显示确切参数名和类型
-- ✅ **结构化说明**：object/array 类型展示内部结构
-- ✅ **关键规则强调**：用 `<CRITICAL_RULES>` 突出重要约束
-- ✅ **完整性验证**：提取时验证必需字段（function.name、arguments）
-- ✅ **递归类型处理**：自动为嵌套 object/array 生成正确示例
+## 🐛 故障排查
 
-## 故障排查
+### 401 Unauthorized
 
-- **Invalid API key**: 检查 `.env` 中 `VALID_API_KEYS`
-- **Model not configured**: 访问 `/v1/models` 查看可用模型
-- **工具调用失败**: 检查工具定义格式
-- **上下文丢失**: 确认 `CONVERSATION_MEMORY_MODE` 配置
+**原因**：API 密钥无效
 
-## 许可证
+**解决**：
+1. 检查 `.env` 中 `VALID_API_KEYS` 配置
+2. 确认请求头 `Authorization: Bearer sk-xxx` 格式正确
 
-MIT License - 详见 [LICENSE](LICENSE)
+### 404 Model not configured
+
+**原因**：模型名称不存在
+
+**解决**：
+1. 访问 `http://127.0.0.1:8000/v1/models` 查看可用模型
+2. 确认 `.env` 中 `DIFY_API_KEYS` 配置正确
+3. 检查 Dify 应用是否正常运行
+
+### 503 Service Unavailable
+
+**原因**：Dify 后端模型过载
+
+**解决**：
+1. 稍后重试
+2. 检查 Dify 后端状态
+3. 查看 Dify 控制台的配额使用情况
+
+### 工具调用未返回
+
+**原因**：模型未理解工具定义
+
+**解决**：
+1. 确认工具定义格式正确
+2. 提供更详细的 `description`
+3. 在 `messages` 中明确要求使用工具
+
+## 🚀 性能优化
+
+代理服务已经过多重优化：
+
+- ✅ **HTTP/2 支持**：提升并发性能
+- ✅ **连接池**：100 个并发连接
+- ✅ **智能缓存**：应用信息缓存 30 分钟
+- ✅ **异步处理**：完全异步的请求处理
+- ✅ **流式传输**：8KB 缓冲区，减少延迟
+
+## 📊 架构设计
+
+```
+┌─────────────┐      HTTP      ┌──────────────┐      Dify API      ┌─────────┐
+│   Client    │───────────────>│   OpenDify   │──────────────────>│  Dify   │
+│ (OpenAI SDK)│                 │    Proxy     │                    │ Backend │
+└─────────────┘<───────────────└──────────────┘<──────────────────└─────────┘
+                  OpenAI                           Dify
+                  Format                          Format
+
+核心流程：
+1. 接收 OpenAI 格式请求
+2. 转换为 Dify 格式
+3. 调用 Dify API
+4. 转换响应为 OpenAI 格式
+5. 返回给客户端
+```
+
+## 📄 许可证
+
+本项目基于 MIT 许可证开源 - 详见 [LICENSE](LICENSE) 文件
 
 ---
 
-⭐ **Star this repo if helpful!** | Made with ❤️ by [realnghon](https://github.com/realnghon)
+⭐ **觉得有用？给个 Star 吧！** | Made with ❤️ by [realnghon](https://github.com/realnghon)

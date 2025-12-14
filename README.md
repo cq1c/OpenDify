@@ -1,263 +1,98 @@
 # OpenDify
 
-**🚀 将 Dify 转换为标准 OpenAI API 的高性能代理服务**
+把 Dify 应用通过一个轻量代理暴露为 OpenAI Chat Completions 兼容 API，方便直接用 OpenAI SDK/生态调用。
 
-将 [Dify](https://dify.ai) 应用完美转换为 OpenAI 兼容接口，让你可以像调用 OpenAI API 一样使用 Dify！
+## 支持的接口
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+- `POST /v1/chat/completions`
+- `GET /v1/models`
+- `GET /v1/models/{model_id}`
 
-## ✨ 核心特性
-
-### 🎯 完全符合 OpenAI API 标准
-- ✅ **标准接口**：`/v1/chat/completions` 和 `/v1/models`
-- ✅ **无缝兼容**：直接使用官方 OpenAI SDK，无需修改代码
-- ✅ **标准格式**：请求/响应格式 100% 符合 OpenAI 规范
-- ✅ **错误处理**：标准的 OpenAI 错误格式
-
-### 🛠️ 完整的 Tool Calls 支持
-- ✅ **标准格式**：`tool_calls` 和 `tool` 消息完全符合规范
-- ✅ **参数验证**：`arguments` 字段正确为 JSON 字符串
-- ✅ **多轮对话**：支持工具调用的完整流程
-- ✅ **自动提取**：智能从模型响应中提取工具调用
-
-### 🌊 高性能流式响应
-- ✅ **SSE 标准**：Server-Sent Events 格式完全标准
-- ✅ **增量更新**：正确的 `delta` 增量格式
-- ✅ **工具流式**：支持流式返回工具调用
-- ✅ **性能优化**：HTTP/2、连接池、智能缓存
-
-### 💬 灵活的对话管理
-- ✅ **无状态设计**：客户端维护对话历史（OpenAI 标准）
-- ✅ **对话上下文**：可选的 Dify conversation_id 支持
-- ✅ **多模型管理**：自动映射 Dify 应用名到模型
-
-## 🚀 快速开始
-
-### 安装依赖
+## 快速开始
 
 ```bash
-# 克隆项目
-git clone https://github.com/realnghon/OpenDify.git
-cd OpenDify
-
-# 安装依赖
 pip install -r requirements.txt
-```
-
-### 配置环境变量
-
-创建 `.env` 文件：
-
-```bash
-# 代理服务的 API 密钥（可设置多个，逗号分隔）
-VALID_API_KEYS=sk-your-secret-key-1,sk-your-secret-key-2
-
-# Dify 应用的 API 密钥（可设置多个应用）
-DIFY_API_KEYS=app-xxx,app-yyy,app-zzz
-
-# Dify API 基础 URL
-DIFY_API_BASE=https://api.dify.ai/v1
-
-# 服务器配置（可选）
-SERVER_HOST=127.0.0.1
-SERVER_PORT=8000
-WORKERS=1
-
-# 超时设置（可选）
-TIMEOUT=30.0
-```
-
-### 启动服务
-
-```bash
+cp .env.example .env
 python app.py
 ```
 
-服务将在 `http://127.0.0.1:8000` 启动。
+默认监听：`http://127.0.0.1:8000`
 
-## 🔧 配置说明
+## 配置（.env）
 
-### 环境变量
+| 变量 | 必需 | 默认值 | 说明 |
+|---|---:|---|---|
+| `AUTH_MODE` | 否 | `required` | `required` 校验 `Authorization`；`disabled` 不校验（仅建议内网） |
+| `VALID_API_KEYS` | 否* | - | 代理层 API Key（逗号分隔）；`AUTH_MODE=required` 时必填 |
+| `DIFY_API_BASE` | 否 | `https://api.dify.ai/v1` | Dify API Base（会自动去掉末尾 `/`） |
+| `DIFY_API_KEYS` | 是 | - | Dify 应用 API Key（逗号分隔） |
+| `DIFY_SSL_VERIFY` | 否 | `true` | TLS 校验（自签证书可设为 `false`） |
+| `CONVERSATION_MEMORY_MODE` | 否 | `1` | `1` 全量 messages（最兼容）；`2` 提供 conversation_id 时仅发送增量（长对话更快） |
+| `TIMEOUT` | 否 | `30.0` | 访问 Dify 超时（秒） |
+| `SERVER_HOST` | 否 | `127.0.0.1` | 监听地址 |
+| `SERVER_PORT` | 否 | `8000` | 监听端口 |
+| `WORKERS` | 否 | `1` | Uvicorn workers |
+| `LOG_LEVEL` | 否 | `WARNING` | `DEBUG/INFO/WARNING/ERROR` |
 
-| 变量名 | 说明 | 必需 | 默认值 |
-|--------|------|------|--------|
-| `VALID_API_KEYS` | 代理服务的 API 密钥（逗号分隔） | ✅ | - |
-| `DIFY_API_KEYS` | Dify 应用 API 密钥（逗号分隔） | ✅ | - |
-| `DIFY_API_BASE` | Dify API 基础 URL | ✅ | - |
-| `SERVER_HOST` | 服务器监听地址 | ❌ | `127.0.0.1` |
-| `SERVER_PORT` | 服务器监听端口 | ❌ | `8000` |
-| `WORKERS` | Worker 进程数 | ❌ | `1` |
-| `TIMEOUT` | 请求超时时间（秒） | ❌ | `30.0` |
+## 模型映射
 
-### 模型映射
+启动时会用每个 `DIFY_API_KEY` 调用 Dify `/info` 获取应用名，并在 `/v1/models` 中用“应用名”作为 `model` 返回。
 
-代理服务会自动从 Dify 获取应用名称并映射为模型：
+## 使用示例
 
-1. 启动时自动调用 Dify `/info` 接口
-2. 获取每个应用的名称
-3. 在 `/v1/models` 接口中列出
-4. 使用应用名称作为 `model` 参数
-
-示例：
-- Dify 应用名：`ChatGPT-Assistant`
-- 调用时使用：`model="ChatGPT-Assistant"`
-
-## 📋 API 端点
-
-### POST /v1/chat/completions
-
-标准的 OpenAI Chat Completions 接口。
-
-**请求参数：**
-- `model` (string, 必需): Dify 应用名称
-- `messages` (array, 必需): 对话消息数组
-- `stream` (boolean, 可选): 是否流式响应，默认 `false`
-- `tools` (array, 可选): 工具定义数组
-- `tool_choice` (string|object, 可选): 工具选择策略
-- `user` (string, 可选): 用户标识
-
-**响应格式：**
-
-非流式：
-```json
-{
-  "id": "chatcmpl-xxx",
-  "object": "chat.completion",
-  "created": 1234567890,
-  "model": "your-dify-app-name",
-  "choices": [{
-    "index": 0,
-    "message": {
-      "role": "assistant",
-      "content": "Hello! How can I help you?"
-    },
-    "finish_reason": "stop",
-    "logprobs": null
-  }],
-  "usage": {
-    "prompt_tokens": 10,
-    "completion_tokens": 20,
-    "total_tokens": 30
-  }
-}
-```
-
-流式（SSE）：
-```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"your-model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"your-model","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1234567890,"model":"your-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-
-data: [DONE]
-```
-
-### GET /v1/models
-
-获取可用模型列表。
-
-**响应格式：**
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "ChatGPT-Assistant",
-      "object": "model",
-      "created": 1234567890,
-      "owned_by": "dify"
-    }
-  ]
-}
-```
-
-## 🧪 测试
-
-项目包含完整的测试套件：
+### curl
 
 ```bash
-# 运行标准兼容性测试
-python test_openai_standard.py
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"Your-Dify-App-Name\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}"
 ```
 
-测试覆盖：
-- ✅ 基础对话
-- ✅ 多轮对话
-- ✅ 工具调用
-- ✅ 多轮对话 + 工具调用
-- ✅ 流式响应
+### OpenAI Python SDK（Chat Completions）
 
-## 🐛 故障排查
+```python
+from openai import OpenAI
 
-### 401 Unauthorized
+client = OpenAI(
+    api_key="sk-abc123",
+    base_url="http://127.0.0.1:8000/v1",
+)
 
-**原因**：API 密钥无效
-
-**解决**：
-1. 检查 `.env` 中 `VALID_API_KEYS` 配置
-2. 确认请求头 `Authorization: Bearer sk-xxx` 格式正确
-
-### 404 Model not configured
-
-**原因**：模型名称不存在
-
-**解决**：
-1. 访问 `http://127.0.0.1:8000/v1/models` 查看可用模型
-2. 确认 `.env` 中 `DIFY_API_KEYS` 配置正确
-3. 检查 Dify 应用是否正常运行
-
-### 503 Service Unavailable
-
-**原因**：Dify 后端模型过载
-
-**解决**：
-1. 稍后重试
-2. 检查 Dify 后端状态
-3. 查看 Dify 控制台的配额使用情况
-
-### 工具调用未返回
-
-**原因**：模型未理解工具定义
-
-**解决**：
-1. 确认工具定义格式正确
-2. 提供更详细的 `description`
-3. 在 `messages` 中明确要求使用工具
-
-## 🚀 性能优化
-
-代理服务已经过多重优化：
-
-- ✅ **HTTP/2 支持**：提升并发性能
-- ✅ **连接池**：100 个并发连接
-- ✅ **智能缓存**：应用信息缓存 30 分钟
-- ✅ **异步处理**：完全异步的请求处理
-- ✅ **流式传输**：8KB 缓冲区，减少延迟
-
-## 📊 架构设计
-
-```
-┌─────────────┐      HTTP      ┌──────────────┐      Dify API      ┌─────────┐
-│   Client    │───────────────>│   OpenDify   │──────────────────>│  Dify   │
-│ (OpenAI SDK)│                 │    Proxy     │                    │ Backend │
-└─────────────┘<───────────────└──────────────┘<──────────────────└─────────┘
-                  OpenAI                           Dify
-                  Format                          Format
-
-核心流程：
-1. 接收 OpenAI 格式请求
-2. 转换为 Dify 格式
-3. 调用 Dify API
-4. 转换响应为 OpenAI 格式
-5. 返回给客户端
+resp = client.chat.completions.create(
+    model="Your-Dify-App-Name",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)
 ```
 
-## 📄 许可证
+## Tool calls（tools/tool_calls）
 
-本项目基于 MIT 许可证开源 - 详见 [LICENSE](LICENSE) 文件
+- 请求中可带 `tools` / `tool_choice`（OpenAI 标准参数）。
+- 响应会尽量输出标准 `tool_calls`，并保证 `function.arguments` 为 JSON 字符串。
+- 注意：工具函数不会在 OpenDify/模型侧自动执行；需要由你的客户端执行工具并把结果以 `role="tool"` 消息回传给 `/v1/chat/completions`。
 
----
+## 流式（SSE）
 
-⭐ **觉得有用？给个 Star 吧！** | Made with ❤️ by [realnghon](https://github.com/realnghon)
+- 传 `stream=true` 返回 `text/event-stream`，格式为 OpenAI 的 `chat.completion.chunk`。
+- 可选支持 `stream_options: {"include_usage": true}`（若 Dify 结束事件提供 usage，则透传；否则返回 0）。
+
+## conversation_id（可选）
+
+为了在 Dify 侧复用对话上下文：
+
+- 非流式响应会在 header 中返回 `X-Dify-Conversation-Id`（若 Dify 返回了 conversation_id）。
+- 下次请求可通过 header `X-Dify-Conversation-Id` 或 body 字段 `conversation_id` 传回；并可配合 `CONVERSATION_MEMORY_MODE=2` 提升长对话性能。
+
+## 测试
+
+```bash
+python test.py
+```
+
+运行前请在 `test.py` 里修改：`BASE_URL` / `API_KEY` / `MODEL`。
+
+## 兼容性说明（当前实现）
+
+- 仅支持 `n=1`（其它会返回 400）。
+- 仅实现 Chat Completions 相关接口，不包含 `/v1/responses`、Embeddings 等。

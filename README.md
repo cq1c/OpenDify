@@ -1,10 +1,12 @@
 # OpenDify
 
-把 Dify 应用通过一个轻量代理暴露为 OpenAI Chat Completions 兼容 API，方便直接用 OpenAI SDK/生态调用。
+把 Dify 应用通过一个轻量代理暴露为多种兼容接口，方便直接用现有 SDK/生态调用。
 
 ## 支持的接口
 
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/messages`（Claude / Anthropic Messages）
 - `GET /v1/models`
 - `GET /v1/models/{model_id}`
 
@@ -66,6 +68,34 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+### OpenAI Python SDK（Responses）
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-abc123",
+    base_url="http://127.0.0.1:8000/v1",
+)
+
+resp = client.responses.create(
+    model="Your-Dify-App-Name",
+    input="你好",
+)
+print(resp.output[0].content[0].text)
+```
+
+### Claude / Anthropic Messages（curl）
+
+```bash
+curl http://127.0.0.1:8000/v1/messages \
+  -H "X-API-Key: sk-abc123" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"Your-Dify-App-Name\",\"max_tokens\":256,\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}"
+```
+
+注：鉴权也可使用 `Authorization: Bearer sk-abc123`（与 OpenAI 接口一致）。
+
 ## Tool calls（tools/tool_calls）
 
 - 请求中可带 `tools` / `tool_choice`（OpenAI 标准参数）。
@@ -76,6 +106,8 @@ print(resp.choices[0].message.content)
 
 - 传 `stream=true` 返回 `text/event-stream`，格式为 OpenAI 的 `chat.completion.chunk`。
 - 可选支持 `stream_options: {"include_usage": true}`（若 Dify 结束事件提供 usage，则透传；否则返回 0）。
+- `/v1/responses` 流式会输出带 `type` + `sequence_number` 的事件，并以 `data: [DONE]` 结束。
+- `/v1/messages` 流式为 Anthropic/Claude 事件格式（`event:` + `data:`）。
 
 ## conversation_id（可选）
 
@@ -95,4 +127,4 @@ python test.py
 ## 兼容性说明（当前实现）
 
 - 仅支持 `n=1`（其它会返回 400）。
-- 仅实现 Chat Completions 相关接口，不包含 `/v1/responses`、Embeddings 等。
+- `/v1/responses` 与 `/v1/messages` 覆盖常用字段与流式输出（含 `sequence_number`/事件格式）；未实现 Embeddings 等其它接口。

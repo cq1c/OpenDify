@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenDify - OpenAI Chat Completions 兼容性测试
+OpenDify - OpenAI Chat/Responses + Claude Messages 兼容性测试
 
 运行前：
 1) 启动 OpenDify（python app.py）
@@ -28,12 +28,21 @@ def print_section(title: str) -> None:
 
 
 def raise_if_openai_error(status_code: int, body: Dict[str, Any]) -> None:
-    if "error" not in body:
-        return
-    err = body["error"] or {}
-    raise RuntimeError(
-        f"HTTP {status_code} | {err.get('type')} | {err.get('code')} | {err.get('message')}"
-    )
+    # OpenDify 会对不同兼容接口返回不同的成功结构（例如 Responses 可能包含 "error": null）。
+    # 这里以“HTTP 状态码 >= 400 或明确的 error 对象”为准。
+    if status_code < 400:
+        err = body.get("error")
+        if not isinstance(err, dict):
+            return
+        if not (err.get("message") or err.get("type") or err.get("code")):
+            return
+
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        raise RuntimeError(
+            f"HTTP {status_code} | {err.get('type')} | {err.get('code')} | {err.get('message')}"
+        )
+    raise RuntimeError(f"HTTP {status_code} | {str(body)[:200]}")
 
 
 def safe_eval_decimal_expression(expression: str) -> Decimal:
@@ -318,6 +327,164 @@ async def test_streaming() -> None:
     print("content_len:", len("".join(content_parts)))
 
 
+async def test_openai_responses_basic() -> None:
+    print_section("测试6: OpenAI Responses（blocking）")
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{BASE_URL}/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": MODEL, "input": "用一句话介绍 FastAPI", "stream": False},
+            timeout=30.0,
+        )
+        data = r.json()
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        raise_if_openai_error(r.status_code, data)
+
+        assert data.get("object") == "response"
+        assert isinstance(data.get("output"), list)
+        assert "usage" in data and isinstance(data["usage"], dict)
+        assert "input_tokens_details" in data["usage"] and isinstance(data["usage"]["input_tokens_details"], dict)
+        assert "output_tokens_details" in data["usage"] and isinstance(data["usage"]["output_tokens_details"], dict)
+        assert "error" in data and data["error"] is None
+
+        text = ""
+        for item in data["output"]:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message" and item.get("role") == "assistant":
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        text += part.get("text") or ""
+
+        assert text.strip(), "Responses 未返回文本内容"
+
+
+async def test_openai_responses_streaming() -> None:
+    print_section("测试7: OpenAI Responses（stream）")
+
+    created_received = False
+    completed_received = False
+    text_parts: List[str] = []
+    last_seq: Optional[int] = None
+
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST",
+            f"{BASE_URL}/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": MODEL, "input": "用一句话介绍 HTTP", "stream": True},
+            timeout=30.0,
+        ) as r:
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+
+                event = json.loads(payload)
+                assert isinstance(event.get("sequence_number"), int), "Responses stream 未返回 sequence_number"
+                if last_seq is not None:
+                    assert event["sequence_number"] == last_seq + 1, "sequence_number 不连续"
+                last_seq = event["sequence_number"]
+
+                if event.get("type") == "response.created":
+                    created_received = True
+                if event.get("type") == "response.output_text.delta":
+                    text_parts.append(event.get("delta") or "")
+                if event.get("type") == "response.completed":
+                    completed_received = True
+
+    assert created_received, "未收到 response.created"
+    assert text_parts, "未收到 output_text.delta"
+    assert completed_received, "未收到 response.completed"
+
+
+async def test_claude_messages_basic() -> None:
+    print_section("测试8: Claude Messages（blocking）")
+    req = {
+        "model": MODEL,
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "你好，用一句话介绍自己"}],
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{BASE_URL}/messages",
+            headers={"X-API-Key": API_KEY},
+            json=req,
+            timeout=30.0,
+        )
+        data = r.json()
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        raise_if_openai_error(r.status_code, data)
+
+        assert data.get("type") == "message"
+        assert isinstance(data.get("id"), str) and data["id"]
+        assert data.get("role") == "assistant"
+        assert data.get("model") == MODEL
+        assert "stop_reason" in data
+        assert "stop_sequence" in data
+        assert isinstance(data.get("usage"), dict)
+        assert isinstance(data["usage"].get("input_tokens"), int)
+        assert isinstance(data["usage"].get("output_tokens"), int)
+        assert isinstance(data.get("content"), list)
+
+        text = "".join([b.get("text", "") for b in data["content"] if isinstance(b, dict) and b.get("type") == "text"])
+        assert text.strip(), "Claude Messages 未返回文本内容"
+
+
+async def test_claude_messages_streaming() -> None:
+    print_section("测试9: Claude Messages（stream）")
+    req = {
+        "model": MODEL,
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "用一句话介绍 Rust"}],
+        "stream": True,
+    }
+
+    message_start_received = False
+    message_stop_received = False
+    text_parts: List[str] = []
+
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST",
+            f"{BASE_URL}/messages",
+            headers={"X-API-Key": API_KEY},
+            json=req,
+            timeout=30.0,
+        ) as r:
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+
+                payload = line[6:]
+                if not payload:
+                    continue
+
+                event = json.loads(payload)
+                if event.get("type") == "message_start":
+                    message_start_received = True
+                    msg = event.get("message") or {}
+                    assert isinstance(msg.get("id"), str) and msg["id"]
+                    assert msg.get("role") == "assistant"
+                    assert msg.get("model") == MODEL
+                elif event.get("type") == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text_parts.append(delta.get("text") or "")
+                elif event.get("type") == "message_stop":
+                    message_stop_received = True
+                    break
+
+    assert message_start_received, "未收到 message_start"
+    assert text_parts, "未收到 content_block_delta"
+    assert message_stop_received, "未收到 message_stop"
+
+
 async def run_test(name: str, coro) -> Tuple[str, str]:
     try:
         await coro
@@ -327,7 +494,7 @@ async def run_test(name: str, coro) -> Tuple[str, str]:
 
 
 async def main() -> None:
-    print_section("OpenDify - OpenAI 兼容性测试")
+    print_section("OpenDify - 兼容性测试")
     results: List[Tuple[str, str]] = []
 
     for name, coro in [
@@ -338,6 +505,10 @@ async def main() -> None:
         ("工具调用", test_tool_calls()),
         ("多轮+工具", test_tool_calls_multi_turn()),
         ("流式响应", test_streaming()),
+        ("Responses blocking", test_openai_responses_basic()),
+        ("Responses stream", test_openai_responses_streaming()),
+        ("Claude blocking", test_claude_messages_basic()),
+        ("Claude stream", test_claude_messages_streaming()),
     ]:
         results.append(await run_test(name, coro))
         await asyncio.sleep(1)

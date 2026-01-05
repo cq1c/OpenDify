@@ -5,8 +5,14 @@
 ## 支持的接口
 
 - `POST /v1/chat/completions`
+- `POST /anthropic/v1/chat/completions`（可选：OpenAI Chat Completions -> Anthropic Messages；需配置 `ANTHROPIC_API_KEY`）
 - `POST /v1/responses`
-- `POST /v1/messages`（Claude / Anthropic Messages）
+- `POST /v1/messages`（Claude / Anthropic Messages -> Dify）
+- `POST /v1/messages/count_tokens`（Claude / Anthropic Token Count）
+- `POST /anthropic/v1/messages`（2anthropic：Claude Code / Anthropic SDK -> OpenAI Chat Completions 上游；未配置上游则 fallback 到 Dify）
+- `POST /anthropic/v1/messages/count_tokens`
+- `GET /anthropic/v1/models`
+- `GET /anthropic/v1/models/{model_id}`
 - `GET /v1/models`
 - `GET /v1/models/{model_id}`
 
@@ -35,6 +41,20 @@ python app.py
 | `SERVER_PORT` | 否 | `8000` | 监听端口 |
 | `WORKERS` | 否 | `1` | Uvicorn workers |
 | `LOG_LEVEL` | 否 | `WARNING` | `DEBUG/INFO/WARNING/ERROR` |
+| `ANTHROPIC_API_BASE` | 否 | `https://api.anthropic.com` | Anthropic API Base |
+| `ANTHROPIC_API_KEY` | 否* | - | Anthropic API Key（启用 `/anthropic/*` 时必填） |
+| `ANTHROPIC_MODEL` | 否* | - | Anthropic 上游模型（不填则使用请求里的 `model`） |
+| `ANTHROPIC_VERSION` | 否 | `2023-06-01` | Anthropic `anthropic-version` header |
+| `ANTHROPIC_MAX_TOKENS` | 否 | `1024` | 未传 `max_tokens` 时的默认值 |
+| `ANTHROPIC_SSL_VERIFY` | 否 | `true` | TLS 校验（自签证书可设为 `false`） |
+| `UPSTREAM_OPENAI_BASE_URL` | 否* | - | 2anthropic 上游 OpenAI ChatCompletions（可为 base 或完整 `/v1/chat/completions`） |
+| `UPSTREAM_OPENAI_API_KEY` | 否* | - | 2anthropic 上游 API Key（Authorization Bearer） |
+| `UPSTREAM_OPENAI_MODEL` | 否 | - | 2anthropic 上游默认模型（不填则使用请求里的 `model`） |
+| `UPSTREAM_OPENAI_MODEL_MAP` | 否 | - | 2anthropic model 映射（`in:out`，逗号分隔，优先级高于 `UPSTREAM_OPENAI_MODEL`） |
+| `UPSTREAM_OPENAI_MAX_TOKENS` | 否 | `1024` | 2anthropic 未传 `max_tokens` 时默认值 |
+| `UPSTREAM_OPENAI_SSL_VERIFY` | 否 | `true` | 2anthropic TLS 校验（自签证书可设为 `false`） |
+
+兼容旧变量名（2anthropic 上游）：`base_url` / `api_key` / `model`（等价于 `UPSTREAM_OPENAI_BASE_URL` / `UPSTREAM_OPENAI_API_KEY` / `UPSTREAM_OPENAI_MODEL`）。
 
 ## 模型映射
 
@@ -68,6 +88,25 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+### OpenAI Python SDK（Anthropic 后端 / Chat Completions）
+
+注：该接口需配置 `.env` 的 `ANTHROPIC_API_KEY`；OpenAI SDK 的 `base_url` 需要包含 `/v1`；如果是 Claude Code/Anthropic SDK，请使用 `http://127.0.0.1:8000/anthropic` 作为 base（SDK 会自动拼 `/v1/...`）。
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-abc123",
+    base_url="http://127.0.0.1:8000/anthropic/v1",
+)
+
+resp = client.chat.completions.create(
+    model="claude-3-5-sonnet-20241022",  # 也可在 .env 里通过 ANTHROPIC_MODEL 固定上游模型
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)
+```
+
 ### OpenAI Python SDK（Responses）
 
 ```python
@@ -88,13 +127,32 @@ print(resp.output[0].content[0].text)
 ### Claude / Anthropic Messages（curl）
 
 ```bash
-curl http://127.0.0.1:8000/v1/messages \
+curl http://127.0.0.1:8000/anthropic/v1/messages \
   -H "X-API-Key: sk-abc123" \
+  -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"Your-Dify-App-Name\",\"max_tokens\":256,\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}"
+  -d "{\"model\":\"claude-opus-4-5\",\"max_tokens\":256,\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}"
 ```
 
-注：鉴权也可使用 `Authorization: Bearer sk-abc123`（与 OpenAI 接口一致）。
+注：也可直接用 `POST /v1/messages`（Dify 后端）；鉴权也可使用 `Authorization: Bearer sk-abc123`（与 OpenAI 接口一致）。
+
+### Claude Code / Anthropic SDK（推荐）
+
+你需要配置两部分：
+
+1) OpenDify 服务端（`.env`）：配置上游 OpenAI ChatCompletions（这是“被转换的接口”）
+
+- `UPSTREAM_OPENAI_BASE_URL`（或旧变量 `base_url`）指向你的 OpenAI 兼容地址（例如 `https://127.0.0.1:8080/v1/chat/completions`）
+- `UPSTREAM_OPENAI_API_KEY`（或旧变量 `api_key`）为上游 key
+- `UPSTREAM_OPENAI_MODEL`（或旧变量 `model`）为上游默认模型（可选）
+
+2) Claude Code / Anthropic SDK 客户端：把 base_url 指向 OpenDify（这是“转换后的 Anthropic 接口”）
+
+- base_url：`http://127.0.0.1:8000/anthropic`（不要带 `/v1`）
+- api_key：使用 OpenDify 的 `VALID_API_KEYS` 之一
+
+说明：`ANTHROPIC_API_BASE` 是 OpenDify 用来访问“真实 Anthropic 上游（/v1/messages）”的配置，只影响 `/anthropic/v1/chat/completions`；它不能指向 OpenAI 的 `/v1/chat/completions`。
+要求：你的上游 OpenAI 兼容接口需要支持 `tools/tool_calls`（函数调用）；否则 Claude Code 会因无法执行工具调用而报错（常见提示：`Improperly formed request`）。
 
 ## Tool calls（tools/tool_calls）
 
@@ -122,7 +180,7 @@ curl http://127.0.0.1:8000/v1/messages \
 python test.py
 ```
 
-运行前请在 `test.py` 里修改：`BASE_URL` / `API_KEY` / `MODEL`。
+`test.py`：包含 Unit + Integration；Integration 需先启动服务（`python app.py`），并默认从 `.env` 读取配置（也可用 `TEST_SERVER_ORIGIN/TEST_PROXY_API_KEY/TEST_DIFY_MODEL/TEST_CLAUDE_MODEL` 覆盖）。
 
 ## 兼容性说明（当前实现）
 

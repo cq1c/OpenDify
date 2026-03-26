@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, AsyncGenerator, Any, Tuple
 from datetime import datetime, timedelta, timezone
 import secrets
 from starlette.background import BackgroundTask
+from json_repair import repair_json
 
 # 加载环境变量（优先于日志配置）
 from dotenv import load_dotenv
@@ -56,6 +57,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+TOOL_CALLS_MODE = _env_flag("TOOL_CALLS_MODE", False)
 
 def _env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
     for name in names:
@@ -704,12 +707,30 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
     if not tool_definitions:
         return ""
 
+    fence_lang = "tool_calls" if TOOL_CALLS_MODE else "json"
+    example_json = ujson.dumps(
+        {
+            "tool_calls": [
+                {
+                    "id": "call_xxx",
+                    "type": "function",
+                    "function": {
+                        "name": "function_name",
+                        "arguments": "{\"param\": \"value\"}"
+                    }
+                }
+            ]
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
     return (
         "\n\n# AVAILABLE FUNCTIONS\n" + "\n\n---\n".join(tool_definitions) +
         "\n\n# USAGE INSTRUCTIONS\n"
         "When you need to call a function, respond with JSON:\n"
-        "```json\n"
-        '{"tool_calls": [{"id": "call_xxx", "type": "function", "function": {"name": "function_name", "arguments": "{\\"param\\": \\"value\\"}"}}]}\n'
+        f"```{fence_lang}\n"
+        f"{example_json}\n"
         "```\n"
         "Important: 'arguments' must be a JSON string, not an object.\n"
     )
@@ -717,6 +738,26 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
 
 # 工具提取
 TOOL_CALL_FENCE_PATTERN = re.compile(r"```json\s*(\{[^`]+\})\s*```", re.DOTALL)
+TOOL_CALLS_FENCE_PATTERN = re.compile(r"```tool_calls\s*(\{[^`]+\})\s*```", re.DOTALL)
+TOOL_CALL_ANY_FENCE_PATTERN = re.compile(r"```(?:json|tool_calls)\s*(\{[^`]+\})\s*```", re.DOTALL)
+
+
+def _parse_tool_json(raw: str) -> Optional[Dict[str, Any]]:
+    """Parse tool call JSON using json_repair for robustness."""
+    try:
+        parsed = ujson.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    try:
+        repaired = repair_json(raw, return_objects=True)
+        if isinstance(repaired, dict):
+            return repaired
+    except Exception:
+        pass
+    return None
+
 
 def extract_tool_invocations(text: str) -> Optional[List[Dict[str, Any]]]:
     """从响应文本中提取工具调用"""
@@ -725,38 +766,34 @@ def extract_tool_invocations(text: str) -> Optional[List[Dict[str, Any]]]:
 
     scannable_text = text[:SCAN_LIMIT]
 
-    # 尝试从JSON代码块提取
-    json_blocks = TOOL_CALL_FENCE_PATTERN.findall(scannable_text)
+    # 尝试从JSON代码块提取（支持 ```json 和 ```tool_calls 两种围栏）
+    json_blocks = TOOL_CALL_ANY_FENCE_PATTERN.findall(scannable_text)
     for json_block in json_blocks:
-        try:
-            parsed_data = ujson.loads(json_block)
-            tool_calls = parsed_data.get("tool_calls")
-            if tool_calls and isinstance(tool_calls, list):
-                # 标准化格式
-                for tc in tool_calls:
-                    if "function" in tc and "arguments" in tc["function"]:
-                        if not isinstance(tc["function"]["arguments"], str):
-                            tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
-                return tool_calls
-        except (ujson.JSONDecodeError, AttributeError):
+        parsed_data = _parse_tool_json(json_block)
+        if parsed_data is None:
             continue
+        tool_calls = parsed_data.get("tool_calls")
+        if tool_calls and isinstance(tool_calls, list):
+            # 标准化格式
+            for tc in tool_calls:
+                if "function" in tc and "arguments" in tc["function"]:
+                    if not isinstance(tc["function"]["arguments"], str):
+                        tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
+            return tool_calls
 
     return None
 
 
 def remove_tool_json_content(text: str) -> str:
-    """从响应文本中移除工具JSON内容"""
+    """从响应文本中移除工具JSON内容（支持 ```json 和 ```tool_calls 两种围栏）"""
     def remove_tool_call_block(match: re.Match) -> str:
         json_content = match.group(1)
-        try:
-            parsed_data = ujson.loads(json_content)
-            if "tool_calls" in parsed_data:
-                return ""
-        except:
-            pass
+        parsed_data = _parse_tool_json(json_content)
+        if parsed_data is not None and "tool_calls" in parsed_data:
+            return ""
         return match.group(0)
 
-    return TOOL_CALL_FENCE_PATTERN.sub(remove_tool_call_block, text).strip()
+    return TOOL_CALL_ANY_FENCE_PATTERN.sub(remove_tool_call_block, text).strip()
 
 
 def _normalize_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2264,6 +2301,128 @@ async def stream_openai_chat_completion_as_claude_message(
     yield sse("message_stop", {"type": "message_stop"})
 
 
+class _StreamToolCallInterceptor:
+    """
+    Real-time ```tool_calls ... ``` fence interceptor for TOOL_CALLS_MODE.
+
+    When TOOL_CALLS_MODE is enabled, this intercepts text deltas during streaming.
+    It detects the opening ```tool_calls fence, buffers content inside it, and when
+    the closing ``` is found, parses the buffered JSON and returns extracted tool calls.
+    Text outside the fence is passed through normally.
+    """
+
+    # Match the start of a tool_calls fence: ```tool_calls (possibly with trailing whitespace/newline)
+    _FENCE_OPEN = re.compile(r"```tool_calls\s*")
+    _FENCE_CLOSE = "```"
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self._inside_fence = False
+        self._fence_buffer = ""
+        # Partial detection buffer for incomplete fence markers arriving across chunks
+        self._pending_text = ""
+
+    def feed(self, text: str) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
+        """
+        Feed a text delta.
+
+        Returns (passthrough_text, extracted_tool_calls):
+        - passthrough_text: text to emit as normal content (may be None if fully intercepted)
+        - extracted_tool_calls: list of tool calls if a complete fence was parsed (else None)
+        """
+        if not self.enabled:
+            return text, None
+
+        combined = self._pending_text + text
+        self._pending_text = ""
+
+        passthrough_parts: List[str] = []
+        tool_calls_result: Optional[List[Dict[str, Any]]] = None
+
+        while combined:
+            if self._inside_fence:
+                # Look for closing ```
+                close_idx = combined.find(self._FENCE_CLOSE)
+                if close_idx == -1:
+                    # Might end with partial ``` (1 or 2 backticks)
+                    if combined.endswith("`") or combined.endswith("``"):
+                        tail_len = 1 if combined.endswith("`") and not combined.endswith("``") else 2
+                        self._fence_buffer += combined[:-tail_len]
+                        self._pending_text = combined[-tail_len:]
+                    else:
+                        self._fence_buffer += combined
+                    combined = ""
+                else:
+                    self._fence_buffer += combined[:close_idx]
+                    self._inside_fence = False
+                    # Parse the buffered content
+                    tool_calls_result = self._parse_fence_content(self._fence_buffer)
+                    self._fence_buffer = ""
+                    # Continue processing after the closing ```
+                    combined = combined[close_idx + 3:]
+            else:
+                # Look for opening ```tool_calls
+                m = self._FENCE_OPEN.search(combined)
+                if m:
+                    # Emit text before the fence
+                    before = combined[:m.start()]
+                    if before:
+                        passthrough_parts.append(before)
+                    self._inside_fence = True
+                    self._fence_buffer = ""
+                    combined = combined[m.end():]
+                else:
+                    # Check for partial fence opening at the end
+                    # e.g. text ending with "```", "```t", "```to", "```tool", etc.
+                    partial_marker = "```tool_calls"
+                    pending_start = None
+                    for k in range(1, min(len(partial_marker), len(combined)) + 1):
+                        if combined.endswith(partial_marker[:k]):
+                            pending_start = len(combined) - k
+                            break
+                    if pending_start is not None:
+                        if combined[:pending_start]:
+                            passthrough_parts.append(combined[:pending_start])
+                        self._pending_text = combined[pending_start:]
+                    else:
+                        passthrough_parts.append(combined)
+                    combined = ""
+
+        passthrough = "".join(passthrough_parts) if passthrough_parts else None
+        return passthrough, tool_calls_result
+
+    def flush(self) -> Optional[str]:
+        """Flush any remaining pending/buffered text (e.g. on stream end)."""
+        result_parts: List[str] = []
+        if self._pending_text:
+            result_parts.append(self._pending_text)
+            self._pending_text = ""
+        if self._inside_fence and self._fence_buffer:
+            # Incomplete fence -- emit it as-is
+            result_parts.append("```tool_calls\n" + self._fence_buffer)
+            self._fence_buffer = ""
+            self._inside_fence = False
+        return "".join(result_parts) if result_parts else None
+
+    @staticmethod
+    def _parse_fence_content(content: str) -> Optional[List[Dict[str, Any]]]:
+        """Parse buffered fence content into tool calls."""
+        content = content.strip()
+        if not content:
+            return None
+        parsed = _parse_tool_json(content)
+        if parsed is None:
+            return None
+        tool_calls = parsed.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return None
+        for tc in tool_calls:
+            if isinstance(tc, dict) and "function" in tc and "arguments" in tc["function"]:
+                if not isinstance(tc["function"]["arguments"], str):
+                    tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
+        return tool_calls
+
+
 async def stream_openai_response(
     rsp: httpx.Response,
     *,
@@ -2275,6 +2434,7 @@ async def stream_openai_response(
     tool_calls_sent = False
     accumulated_for_tools = ""  # 仅用于工具提取（限制长度）
     usage_obj: Optional[Dict[str, Any]] = None
+    interceptor = _StreamToolCallInterceptor(enabled=TOOL_CALLS_MODE)
 
     def make_sse_chunk(delta_content: str = None, delta_role: str = None,
                        delta_tool_calls: List[Dict] = None, finish_reason: str = None) -> str:
@@ -2330,7 +2490,21 @@ async def stream_openai_response(
                                 remaining = SCAN_LIMIT - len(accumulated_for_tools)
                                 accumulated_for_tools += answer_delta[:remaining]
 
-                            yield make_sse_chunk(delta_content=answer_delta)
+                            passthrough, rt_tool_calls = interceptor.feed(answer_delta)
+                            if passthrough:
+                                yield make_sse_chunk(delta_content=passthrough)
+                            if rt_tool_calls:
+                                tool_calls_sent = True
+                                normalized = _normalize_tool_calls(rt_tool_calls)
+                                openai_tool_calls = []
+                                for idx, tc in enumerate(normalized):
+                                    openai_tool_calls.append({
+                                        "index": idx,
+                                        "id": tc["id"],
+                                        "type": tc.get("type", "function"),
+                                        "function": tc.get("function", {})
+                                    })
+                                yield make_sse_chunk(delta_tool_calls=openai_tool_calls)
 
                     elif event_type == "tool_calls":
                         dify_tool_calls = data.get("tool_calls", [])
@@ -2353,6 +2527,11 @@ async def stream_openai_response(
                             yield make_sse_chunk(delta_tool_calls=openai_tool_calls)
 
                     elif event_type == "message_end":
+                        # Flush any remaining interceptor buffer
+                        flushed = interceptor.flush()
+                        if flushed:
+                            yield make_sse_chunk(delta_content=flushed)
+
                         # 记录 usage（如果 Dify 在结束事件里提供）
                         meta_usage = (data.get("metadata") or {}).get("usage") if isinstance(data.get("metadata"), dict) else None
                         if isinstance(meta_usage, dict):
@@ -2362,7 +2541,7 @@ async def stream_openai_response(
                                 "total_tokens": meta_usage.get("total_tokens", 0),
                             }
 
-                        # 最后尝试提取工具调用
+                        # 最后尝试提取工具调用（fallback for non-TOOL_CALLS_MODE or missed fences）
                         if TOOL_SUPPORT and not tool_calls_sent and accumulated_for_tools:
                             extracted = extract_tool_invocations(accumulated_for_tools)
                             if extracted:
@@ -2596,6 +2775,8 @@ async def stream_openai_responses(
         tool_items_by_id.clear()
         return events
 
+    resp_interceptor = _StreamToolCallInterceptor(enabled=TOOL_CALLS_MODE)
+
     base_response = {
         "id": response_id,
         "object": "response",
@@ -2625,16 +2806,26 @@ async def stream_openai_responses(
 
                     if not isinstance(answer_delta, str):
                         answer_delta = str(answer_delta)
-                    accumulated_text += answer_delta
-                    yield sse(
-                        {
-                            "type": "response.output_text.delta",
-                            "item_id": message_item_id,
-                            "output_index": output_index,
-                            "content_index": content_index,
-                            "delta": answer_delta,
-                        }
-                    )
+
+                    passthrough, rt_tool_calls = resp_interceptor.feed(answer_delta)
+                    if passthrough:
+                        accumulated_text += passthrough
+                        yield sse(
+                            {
+                                "type": "response.output_text.delta",
+                                "item_id": message_item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "delta": passthrough,
+                            }
+                        )
+                    if rt_tool_calls:
+                        normalized = _normalize_tool_calls(rt_tool_calls)
+                        if message_open:
+                            for ev in _close_message_item(accumulated_text):
+                                yield sse(ev)
+                        for ev in _start_tool_items(normalized):
+                            yield sse(ev)
 
             elif event_type == "tool_calls":
                 dify_tool_calls = data.get("tool_calls", [])
@@ -2647,6 +2838,23 @@ async def stream_openai_responses(
                         yield sse(ev)
 
             elif event_type == "message_end":
+                # Flush any remaining interceptor buffer
+                resp_flushed = resp_interceptor.flush()
+                if resp_flushed:
+                    if not message_open:
+                        for ev in _start_message_item():
+                            yield sse(ev)
+                    accumulated_text += resp_flushed
+                    yield sse(
+                        {
+                            "type": "response.output_text.delta",
+                            "item_id": message_item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "delta": resp_flushed,
+                        }
+                    )
+
                 meta_usage = (data.get("metadata") or {}).get("usage") if isinstance(data.get("metadata"), dict) else None
                 if isinstance(meta_usage, dict):
                     usage_obj = {
@@ -2715,6 +2923,7 @@ async def stream_claude_message(
     content_index = 0
     text_block_open = True
     current_text_index = 0
+    claude_interceptor = _StreamToolCallInterceptor(enabled=TOOL_CALLS_MODE)
 
     def sse(event_name: str, payload: Dict[str, Any]) -> str:
         return f"event: {event_name}\ndata: {ujson.dumps(payload, ensure_ascii=False)}\n\n"
@@ -2752,23 +2961,60 @@ async def stream_claude_message(
                     if not isinstance(answer_delta, str):
                         answer_delta = str(answer_delta)
 
-                    if not text_block_open:
-                        current_text_index = content_index
-                        text_block_open = True
-                        yield sse(
-                            "content_block_start",
-                            {"type": "content_block_start", "index": current_text_index, "content_block": {"type": "text", "text": ""}},
-                        )
+                    passthrough, rt_tool_calls = claude_interceptor.feed(answer_delta)
+                    if passthrough:
+                        if not text_block_open:
+                            current_text_index = content_index
+                            text_block_open = True
+                            yield sse(
+                                "content_block_start",
+                                {"type": "content_block_start", "index": current_text_index, "content_block": {"type": "text", "text": ""}},
+                            )
 
-                    accumulated_text += answer_delta
-                    yield sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": current_text_index,
-                            "delta": {"type": "text_delta", "text": answer_delta},
-                        },
-                    )
+                        accumulated_text += passthrough
+                        yield sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": current_text_index,
+                                "delta": {"type": "text_delta", "text": passthrough},
+                            },
+                        )
+                    if rt_tool_calls:
+                        normalized = _normalize_tool_calls(rt_tool_calls)
+                        tool_calls_sent = True
+
+                        if text_block_open:
+                            yield sse("content_block_stop", {"type": "content_block_stop", "index": current_text_index})
+                            text_block_open = False
+                            content_index = current_text_index + 1
+
+                        for tc in normalized:
+                            call_id = tc.get("id") or f"call_{fast_uuid()}"
+                            func = tc.get("function") or {}
+                            name = (func or {}).get("name") or ""
+                            args = (func or {}).get("arguments") or ""
+
+                            tool_idx = content_index
+                            yield sse(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": tool_idx,
+                                    "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}},
+                                },
+                            )
+                            if isinstance(args, str) and args:
+                                yield sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": tool_idx,
+                                        "delta": {"type": "input_json_delta", "partial_json": args},
+                                    },
+                                )
+                            yield sse("content_block_stop", {"type": "content_block_stop", "index": tool_idx})
+                            content_index += 1
 
             elif event_type == "tool_calls":
                 dify_tool_calls = data.get("tool_calls", [])
@@ -2809,6 +3055,26 @@ async def stream_claude_message(
                         content_index += 1
 
             elif event_type == "message_end":
+                # Flush any remaining interceptor buffer
+                claude_flushed = claude_interceptor.flush()
+                if claude_flushed:
+                    if not text_block_open:
+                        current_text_index = content_index
+                        text_block_open = True
+                        yield sse(
+                            "content_block_start",
+                            {"type": "content_block_start", "index": current_text_index, "content_block": {"type": "text", "text": ""}},
+                        )
+                    accumulated_text += claude_flushed
+                    yield sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": current_text_index,
+                            "delta": {"type": "text_delta", "text": claude_flushed},
+                        },
+                    )
+
                 meta_usage = (data.get("metadata") or {}).get("usage") if isinstance(data.get("metadata"), dict) else None
                 if isinstance(meta_usage, dict):
                     usage_obj = {

@@ -7,3 +7,4 @@ openai
 psutil
 typing-extensions
 python-multipart
+json-repair

@@ -688,30 +688,29 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
 
         tool_info = [f"## {function_name}", f"**Purpose**: {function_description}"]
 
-        parameter_properties = parameters.get("properties", {}) or {}
-        required_parameters = set(parameters.get("required", []) or [])
-
-        if parameter_properties:
-            tool_info.append("**Parameters**:")
-            for param_name, param_details in parameter_properties.items():
-                param_type = (param_details or {}).get("type", "any")
-                param_desc = (param_details or {}).get("description", "")
-                requirement_flag = "**Required**" if param_name in required_parameters else "*Optional*"
-                tool_info.append(f"- `{param_name}` ({param_type}) - {requirement_flag}: {param_desc}")
+        if parameters:
+            tool_info.append("**Parameters** (JSON Schema):")
+            tool_info.append("```json")
+            tool_info.append(ujson.dumps(parameters, ensure_ascii=False, indent=2))
+            tool_info.append("```")
 
         tool_definitions.append("\n".join(tool_info))
 
     if not tool_definitions:
         return ""
 
+    example = ujson.dumps(
+        {"tool_calls": [{"id": "call_xxx", "type": "function", "function": {"name": "function_name", "arguments": {"param": "value"}}}]},
+        ensure_ascii=False,
+    )
+
     return (
         "\n\n# AVAILABLE FUNCTIONS\n" + "\n\n---\n".join(tool_definitions) +
         "\n\n# USAGE INSTRUCTIONS\n"
         "When you need to call a function, respond with JSON:\n"
         "```json\n"
-        '{"tool_calls": [{"id": "call_xxx", "type": "function", "function": {"name": "function_name", "arguments": "{\\"param\\": \\"value\\"}"}}]}\n'
+        f"{example}\n"
         "```\n"
-        "Important: 'arguments' must be a JSON string, not an object.\n"
     )
 
 

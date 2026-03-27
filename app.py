@@ -645,8 +645,10 @@ def transform_openai_to_dify(openai_request: Dict[str, Any], conversation_id: Op
                 query_parts.append(f"[Tool '{tool_name}' Result]: {content}")
 
     # 添加工具定义
+    tool_anchor_id: Optional[str] = None
     if tools and TOOL_SUPPORT and tool_choice != "none":
-        tools_prompt = generate_tool_prompt(tools)
+        tool_anchor_id = secrets.token_hex(2)  # 4位随机十六进制字符串
+        tools_prompt = generate_tool_prompt(tools, tool_anchor_id)
         query_parts.insert(0, tools_prompt)
 
         if tool_choice == "required":
@@ -668,11 +670,14 @@ def transform_openai_to_dify(openai_request: Dict[str, Any], conversation_id: Op
     if conversation_id:
         dify_request["conversation_id"] = conversation_id
 
+    if tool_anchor_id:
+        dify_request["_tool_anchor_id"] = tool_anchor_id
+
     return dify_request
 
 
-def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
-    """生成工具定义提示"""
+def generate_tool_prompt(tools: List[Dict[str, Any]], anchor_id: str) -> str:
+    """生成工具定义提示，使用锚点标记工具调用"""
     if not tools:
         return ""
 
@@ -699,6 +704,7 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
     if not tool_definitions:
         return ""
 
+    anchor_marker = f"[[[TOOL-CALLS-{anchor_id}]]]"
     example = ujson.dumps(
         {"tool_calls": [{"id": "call_xxx", "type": "function", "function": {"name": "function_name", "arguments": {"param": "value"}}}]},
         ensure_ascii=False,
@@ -707,55 +713,76 @@ def generate_tool_prompt(tools: List[Dict[str, Any]]) -> str:
     return (
         "\n\n# AVAILABLE FUNCTIONS\n" + "\n\n---\n".join(tool_definitions) +
         "\n\n# USAGE INSTRUCTIONS\n"
-        "When you need to call a function, respond with JSON:\n"
-        "```json\n"
-        f"{example}\n"
-        "```\n"
+        f"When you need to call a function, place the marker {anchor_marker} at the end of your response, "
+        "followed immediately by the tool call JSON on a new line. Everything after the marker until the end "
+        "of your response must be valid JSON. Do NOT wrap the JSON in code fences.\n"
+        f"Example:\n{anchor_marker}\n{example}\n"
     )
 
 
-# 工具提取
-TOOL_CALL_FENCE_PATTERN = re.compile(r"```json\s*(\{[^`]+\})\s*```", re.DOTALL)
+# 工具提取 — 基于锚点标记 [[[TOOL-CALLS-XXXX]]]
+TOOL_CALL_ANCHOR_PATTERN = re.compile(r"\[\[\[TOOL-CALLS-([0-9a-fA-F]{4})\]\]\]", re.DOTALL)
 
-def extract_tool_invocations(text: str) -> Optional[List[Dict[str, Any]]]:
-    """从响应文本中提取工具调用"""
+def extract_tool_invocations(text: str, anchor_id: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    """从响应文本中提取工具调用。当提供 anchor_id 时仅匹配对应锚点，防止提示词注入。"""
     if not text:
         return None
 
-    scannable_text = text[:SCAN_LIMIT]
-
-    # 尝试从JSON代码块提取
-    json_blocks = TOOL_CALL_FENCE_PATTERN.findall(scannable_text)
-    for json_block in json_blocks:
+    if anchor_id:
+        # 精确匹配指定锚点
+        marker = f"[[[TOOL-CALLS-{anchor_id}]]]"
+        pos = text.find(marker)
+        if pos < 0:
+            return None
+        json_part = text[pos + len(marker):].strip()
+        if not json_part:
+            return None
         try:
-            parsed_data = ujson.loads(json_block)
+            parsed_data = ujson.loads(json_part)
             tool_calls = parsed_data.get("tool_calls")
             if tool_calls and isinstance(tool_calls, list):
-                # 标准化格式
                 for tc in tool_calls:
                     if "function" in tc and "arguments" in tc["function"]:
                         if not isinstance(tc["function"]["arguments"], str):
                             tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
                 return tool_calls
-        except (ujson.JSONDecodeError, AttributeError):
-            continue
+        except (ujson.JSONDecodeError, AttributeError, ValueError):
+            return None
+    else:
+        # 无 anchor_id 时使用通用锚点模式匹配（兼容旧路径）
+        match = TOOL_CALL_ANCHOR_PATTERN.search(text[:SCAN_LIMIT])
+        if match:
+            json_part = text[match.end():].strip()
+            if json_part:
+                try:
+                    parsed_data = ujson.loads(json_part)
+                    tool_calls = parsed_data.get("tool_calls")
+                    if tool_calls and isinstance(tool_calls, list):
+                        for tc in tool_calls:
+                            if "function" in tc and "arguments" in tc["function"]:
+                                if not isinstance(tc["function"]["arguments"], str):
+                                    tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
+                        return tool_calls
+                except (ujson.JSONDecodeError, AttributeError, ValueError):
+                    pass
 
     return None
 
 
-def remove_tool_json_content(text: str) -> str:
-    """从响应文本中移除工具JSON内容"""
-    def remove_tool_call_block(match: re.Match) -> str:
-        json_content = match.group(1)
-        try:
-            parsed_data = ujson.loads(json_content)
-            if "tool_calls" in parsed_data:
-                return ""
-        except:
-            pass
-        return match.group(0)
-
-    return TOOL_CALL_FENCE_PATTERN.sub(remove_tool_call_block, text).strip()
+def remove_tool_json_content(text: str, anchor_id: Optional[str] = None) -> str:
+    """从响应文本中移除锚点及其后的工具调用JSON内容"""
+    if anchor_id:
+        marker = f"[[[TOOL-CALLS-{anchor_id}]]]"
+        pos = text.find(marker)
+        if pos >= 0:
+            return text[:pos].strip()
+        return text.strip()
+    else:
+        # 无 anchor_id 时使用通用锚点模式
+        match = TOOL_CALL_ANCHOR_PATTERN.search(text)
+        if match:
+            return text[:match.start()].strip()
+        return text.strip()
 
 
 def _normalize_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -896,17 +923,17 @@ def _responses_input_to_chat_messages(input_value: Any) -> List[Dict[str, Any]]:
     return [{"role": "user", "content": str(input_value)}]
 
 
-def transform_dify_to_openai_response(dify_response: Dict[str, Any], model: str) -> Tuple[Dict[str, Any], Optional[str]]:
+def transform_dify_to_openai_response(dify_response: Dict[str, Any], model: str, anchor_id: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[str]]:
     """将Dify响应转换为OpenAI标准格式"""
     answer = dify_response.get("answer", "")
     tool_calls: List[Dict[str, Any]] = []
 
     # 提取工具调用
     if answer and TOOL_SUPPORT:
-        extracted_tools = extract_tool_invocations(answer)
+        extracted_tools = extract_tool_invocations(answer, anchor_id)
         if extracted_tools:
             tool_calls = _normalize_tool_calls(extracted_tools)
-            answer = remove_tool_json_content(answer)
+            answer = remove_tool_json_content(answer, anchor_id)
 
     # Dify原生工具调用
     if "tool_calls" in dify_response and not tool_calls:
@@ -987,16 +1014,16 @@ def transform_openai_responses_to_dify(
     return transform_openai_to_dify(openai_like, conversation_id)
 
 
-def transform_dify_to_openai_responses(dify_response: Dict[str, Any], model: str) -> Tuple[Dict[str, Any], Optional[str]]:
+def transform_dify_to_openai_responses(dify_response: Dict[str, Any], model: str, anchor_id: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[str]]:
     answer = dify_response.get("answer", "")
     tool_calls: List[Dict[str, Any]] = []
 
-    # Extract tool calls from fenced JSON (OpenDify prompt convention)
+    # Extract tool calls via anchor marker
     if answer and TOOL_SUPPORT:
-        extracted_tools = extract_tool_invocations(answer)
+        extracted_tools = extract_tool_invocations(answer, anchor_id)
         if extracted_tools:
             tool_calls = _normalize_tool_calls(extracted_tools)
-            answer = remove_tool_json_content(answer)
+            answer = remove_tool_json_content(answer, anchor_id)
 
     # Dify native tool calls
     if "tool_calls" in dify_response and not tool_calls:
@@ -1496,15 +1523,15 @@ def transform_openai_chat_completion_to_claude_message(openai_resp: Dict[str, An
     }
 
 
-def transform_dify_to_claude_message(dify_response: Dict[str, Any], model: str) -> Tuple[Dict[str, Any], Optional[str]]:
+def transform_dify_to_claude_message(dify_response: Dict[str, Any], model: str, anchor_id: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[str]]:
     answer = dify_response.get("answer", "")
     tool_calls: List[Dict[str, Any]] = []
 
     if answer and TOOL_SUPPORT:
-        extracted_tools = extract_tool_invocations(answer)
+        extracted_tools = extract_tool_invocations(answer, anchor_id)
         if extracted_tools:
             tool_calls = _normalize_tool_calls(extracted_tools)
-            answer = remove_tool_json_content(answer)
+            answer = remove_tool_json_content(answer, anchor_id)
 
     if "tool_calls" in dify_response and not tool_calls:
         tool_calls = _normalize_tool_calls(list(dify_response.get("tool_calls") or []))
@@ -2269,6 +2296,7 @@ async def stream_openai_response(
     model: str,
     message_id: str,
     stream_include_usage: bool,
+    anchor_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """流式返回OpenAI标准SSE响应"""
     tool_calls_sent = False
@@ -2363,7 +2391,7 @@ async def stream_openai_response(
 
                         # 最后尝试提取工具调用
                         if TOOL_SUPPORT and not tool_calls_sent and accumulated_for_tools:
-                            extracted = extract_tool_invocations(accumulated_for_tools)
+                            extracted = extract_tool_invocations(accumulated_for_tools, anchor_id)
                             if extracted:
                                 tool_calls_sent = True
                                 normalized = _normalize_tool_calls(extracted)
@@ -2421,6 +2449,7 @@ async def stream_openai_responses(
     *,
     model: str,
     response_id: str,
+    anchor_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     created_at = int(time.time())
     sequence_number = 0
@@ -2658,7 +2687,7 @@ async def stream_openai_responses(
 
                 extracted_tool_calls: List[Dict[str, Any]] = []
                 if TOOL_SUPPORT and not tool_items_in_order and accumulated_text:
-                    extracted = extract_tool_invocations(accumulated_text)
+                    extracted = extract_tool_invocations(accumulated_text, anchor_id)
                     if extracted:
                         extracted_tool_calls = _normalize_tool_calls(extracted)
 
@@ -2708,6 +2737,7 @@ async def stream_claude_message(
     *,
     model: str,
     message_id: str,
+    anchor_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     accumulated_text = ""
     tool_calls_sent = False
@@ -2817,7 +2847,7 @@ async def stream_claude_message(
 
                 extracted_tool_calls: List[Dict[str, Any]] = []
                 if TOOL_SUPPORT and not tool_calls_sent and accumulated_text:
-                    extracted = extract_tool_invocations(accumulated_text)
+                    extracted = extract_tool_invocations(accumulated_text, anchor_id)
                     if extracted:
                         tool_calls_sent = True
                         extracted_tool_calls = _normalize_tool_calls(extracted)
@@ -2907,6 +2937,8 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         if not dify_req:
             raise OpenAIHTTPError(400, "Invalid format", code="invalid_request_error", param=None)
 
+        tool_anchor_id = dify_req.pop("_tool_anchor_id", None)
+
         stream = openai_request.get("stream", False)
         if stream:
             stream_options = openai_request.get("stream_options") or {}
@@ -2949,6 +2981,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
                     model=model,
                     message_id=message_id,
                     stream_include_usage=stream_include_usage,
+                    anchor_id=tool_anchor_id,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -3006,7 +3039,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
             )
 
         dify_resp = ujson.loads(resp.content)
-        openai_resp, resp_conversation_id = transform_dify_to_openai_response(dify_resp, model)
+        openai_resp, resp_conversation_id = transform_dify_to_openai_response(dify_resp, model, anchor_id=tool_anchor_id)
 
         response_headers = {"access-control-allow-origin": "*"}
         if resp_conversation_id:
@@ -3206,6 +3239,8 @@ async def responses_api(request: Request, api_key: str = Depends(verify_api_key)
         if not dify_req:
             raise OpenAIHTTPError(400, "Invalid format", code="invalid_request_error", param=None)
 
+        tool_anchor_id = dify_req.pop("_tool_anchor_id", None)
+
         stream = bool(responses_request.get("stream", False))
         if stream:
             headers = {"Authorization": f"Bearer {dify_key}", "Content-Type": "application/json"}
@@ -3240,7 +3275,7 @@ async def responses_api(request: Request, api_key: str = Depends(verify_api_key)
                 raise OpenAIHTTPError(upstream_rsp.status_code, error_message, type=err_type, code=error_code, param=None)
 
             return StreamingResponse(
-                stream_openai_responses(upstream_rsp, model=model, response_id=response_id),
+                stream_openai_responses(upstream_rsp, model=model, response_id=response_id, anchor_id=tool_anchor_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -3286,7 +3321,7 @@ async def responses_api(request: Request, api_key: str = Depends(verify_api_key)
             )
 
         dify_resp = ujson.loads(resp.content)
-        out_resp, resp_conversation_id = transform_dify_to_openai_responses(dify_resp, model)
+        out_resp, resp_conversation_id = transform_dify_to_openai_responses(dify_resp, model, anchor_id=tool_anchor_id)
 
         response_headers = {"access-control-allow-origin": "*"}
         if resp_conversation_id:
@@ -3394,6 +3429,8 @@ async def claude_messages_api(request: Request, api_key: str = Depends(verify_ap
         if not dify_req:
             raise OpenAIHTTPError(400, "Invalid format", code="invalid_request_error", param=None)
 
+        tool_anchor_id = dify_req.pop("_tool_anchor_id", None)
+
         stream = bool(claude_request.get("stream", False))
         if stream:
             headers = {"Authorization": f"Bearer {dify_key}", "Content-Type": "application/json"}
@@ -3428,7 +3465,7 @@ async def claude_messages_api(request: Request, api_key: str = Depends(verify_ap
                 raise OpenAIHTTPError(upstream_rsp.status_code, error_message, type=err_type, code=error_code, param=None)
 
             return StreamingResponse(
-                stream_claude_message(upstream_rsp, model=model, message_id=message_id),
+                stream_claude_message(upstream_rsp, model=model, message_id=message_id, anchor_id=tool_anchor_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -3474,7 +3511,7 @@ async def claude_messages_api(request: Request, api_key: str = Depends(verify_ap
             )
 
         dify_resp = ujson.loads(resp.content)
-        out_resp, resp_conversation_id = transform_dify_to_claude_message(dify_resp, model)
+        out_resp, resp_conversation_id = transform_dify_to_claude_message(dify_resp, model, anchor_id=tool_anchor_id)
 
         response_headers = {"access-control-allow-origin": "*"}
         if resp_conversation_id:

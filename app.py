@@ -44,7 +44,7 @@ TTL_APP_CACHE = timedelta(minutes=30)
 
 # 工具支持配置
 TOOL_SUPPORT = True
-SCAN_LIMIT = 8000
+SCAN_LIMIT = 100_000_000  # 增加工具提取缓存限制，避免长文本场景下工具调用丢失
 
 def fast_uuid() -> str:
     """快速生成UUID hex"""
@@ -728,6 +728,47 @@ def extract_tool_invocations(text: str, anchor_id: Optional[str] = None) -> Opti
     if not text:
         return None
 
+    def _coerce_tool_calls(parsed: Any) -> Optional[List[Dict[str, Any]]]:
+        tool_calls: Any = None
+        if isinstance(parsed, dict):
+            tool_calls = parsed.get("tool_calls")
+        elif isinstance(parsed, list):
+            tool_calls = parsed
+
+        if tool_calls and isinstance(tool_calls, list):
+            normalized_calls: List[Dict[str, Any]] = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                if "function" in tc and "arguments" in tc["function"]:
+                    if not isinstance(tc["function"]["arguments"], str):
+                        tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
+                normalized_calls.append(tc)
+            if normalized_calls:
+                return normalized_calls
+        return None
+
+    def _parse_tool_payload(raw: str) -> Optional[List[Dict[str, Any]]]:
+        payload = (raw or "").strip()
+        if not payload:
+            return None
+
+        candidates = [payload]
+        fenced_match = re.search(r"```(?:json)?\s*(.*?)\s*```", payload, re.DOTALL | re.IGNORECASE)
+        if fenced_match:
+            candidates.insert(0, fenced_match.group(1).strip())
+
+        for candidate in candidates:
+            try:
+                parsed_data = ujson.loads(candidate)
+            except (ujson.JSONDecodeError, ValueError, TypeError):
+                continue
+
+            coerced = _coerce_tool_calls(parsed_data)
+            if coerced:
+                return coerced
+        return None
+
     if anchor_id:
         # 精确匹配指定锚点
         marker = f"[[[TOOL-CALLS-{anchor_id}]]]"
@@ -737,34 +778,16 @@ def extract_tool_invocations(text: str, anchor_id: Optional[str] = None) -> Opti
         json_part = text[pos + len(marker):].strip()
         if not json_part:
             return None
-        try:
-            parsed_data = ujson.loads(json_part)
-            tool_calls = parsed_data.get("tool_calls")
-            if tool_calls and isinstance(tool_calls, list):
-                for tc in tool_calls:
-                    if "function" in tc and "arguments" in tc["function"]:
-                        if not isinstance(tc["function"]["arguments"], str):
-                            tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
-                return tool_calls
-        except (ujson.JSONDecodeError, AttributeError, ValueError):
-            return None
+        return _parse_tool_payload(json_part)
     else:
         # 无 anchor_id 时使用通用锚点模式匹配（兼容旧路径）
         match = TOOL_CALL_ANCHOR_PATTERN.search(text[:SCAN_LIMIT])
         if match:
             json_part = text[match.end():].strip()
             if json_part:
-                try:
-                    parsed_data = ujson.loads(json_part)
-                    tool_calls = parsed_data.get("tool_calls")
-                    if tool_calls and isinstance(tool_calls, list):
-                        for tc in tool_calls:
-                            if "function" in tc and "arguments" in tc["function"]:
-                                if not isinstance(tc["function"]["arguments"], str):
-                                    tc["function"]["arguments"] = ujson.dumps(tc["function"]["arguments"], ensure_ascii=False)
-                        return tool_calls
-                except (ujson.JSONDecodeError, AttributeError, ValueError):
-                    pass
+                parsed = _parse_tool_payload(json_part)
+                if parsed:
+                    return parsed
 
     return None
 
@@ -2302,6 +2325,7 @@ async def stream_openai_response(
     tool_calls_sent = False
     accumulated_for_tools = ""  # 仅用于工具提取（限制长度）
     usage_obj: Optional[Dict[str, Any]] = None
+    buffer_tool_text = bool(anchor_id and TOOL_SUPPORT)
 
     def make_sse_chunk(delta_content: str = None, delta_role: str = None,
                        delta_tool_calls: List[Dict] = None, finish_reason: str = None) -> str:
@@ -2352,12 +2376,15 @@ async def stream_openai_response(
                     if event_type in ("message", "agent_message"):
                         answer_delta = data.get("answer", "")
                         if answer_delta:
+                            if not isinstance(answer_delta, str):
+                                answer_delta = str(answer_delta)
                             # 限制工具提取缓存，避免长文本占用内存
                             if len(accumulated_for_tools) < SCAN_LIMIT:
                                 remaining = SCAN_LIMIT - len(accumulated_for_tools)
                                 accumulated_for_tools += answer_delta[:remaining]
 
-                            yield make_sse_chunk(delta_content=answer_delta)
+                            if not buffer_tool_text:
+                                yield make_sse_chunk(delta_content=answer_delta)
 
                     elif event_type == "tool_calls":
                         dify_tool_calls = data.get("tool_calls", [])
@@ -2406,6 +2433,11 @@ async def stream_openai_response(
                                     })
                                 yield make_sse_chunk(delta_tool_calls=openai_tool_calls)
 
+                        if buffer_tool_text and not tool_calls_sent and accumulated_for_tools:
+                            final_text = remove_tool_json_content(accumulated_for_tools, anchor_id)
+                            if final_text:
+                                yield make_sse_chunk(delta_content=final_text)
+
                         finish_reason = "tool_calls" if tool_calls_sent else "stop"
                         yield make_sse_chunk(finish_reason=finish_reason)
 
@@ -2453,6 +2485,7 @@ async def stream_openai_responses(
 ) -> AsyncGenerator[str, None]:
     created_at = int(time.time())
     sequence_number = 0
+    buffer_tool_text = bool(anchor_id and TOOL_SUPPORT)
 
     output_index = 0  # current output item index (message uses this until done)
     content_index = 0
@@ -2637,8 +2670,6 @@ async def stream_openai_responses(
     # Initial events
     yield sse({"type": "response.created", "response": base_response})
     yield sse({"type": "response.in_progress", "response": base_response})
-    for ev in _start_message_item():
-        yield sse(ev)
 
     try:
         async for data in _iter_dify_sse_json(rsp):
@@ -2647,22 +2678,22 @@ async def stream_openai_responses(
             if event_type in ("message", "agent_message"):
                 answer_delta = data.get("answer", "")
                 if answer_delta:
-                    if not message_open:
-                        for ev in _start_message_item():
-                            yield sse(ev)
-
                     if not isinstance(answer_delta, str):
                         answer_delta = str(answer_delta)
                     accumulated_text += answer_delta
-                    yield sse(
-                        {
-                            "type": "response.output_text.delta",
-                            "item_id": message_item_id,
-                            "output_index": output_index,
-                            "content_index": content_index,
-                            "delta": answer_delta,
-                        }
-                    )
+                    if not buffer_tool_text:
+                        if not message_open:
+                            for ev in _start_message_item():
+                                yield sse(ev)
+                        yield sse(
+                            {
+                                "type": "response.output_text.delta",
+                                "item_id": message_item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "delta": answer_delta,
+                            }
+                        )
 
             elif event_type == "tool_calls":
                 dify_tool_calls = data.get("tool_calls", [])
@@ -2691,8 +2722,16 @@ async def stream_openai_responses(
                     if extracted:
                         extracted_tool_calls = _normalize_tool_calls(extracted)
 
-                if message_open:
-                    for ev in _close_message_item(accumulated_text):
+                final_text = remove_tool_json_content(accumulated_text, anchor_id) if buffer_tool_text else accumulated_text
+
+                if message_open and final_text:
+                    for ev in _close_message_item(final_text):
+                        yield sse(ev)
+
+                if (not message_open) and final_text and not extracted_tool_calls and not tool_items_in_order:
+                    for ev in _start_message_item():
+                        yield sse(ev)
+                    for ev in _close_message_item(final_text):
                         yield sse(ev)
 
                 if extracted_tool_calls:
@@ -2742,8 +2781,9 @@ async def stream_claude_message(
     accumulated_text = ""
     tool_calls_sent = False
     content_index = 0
-    text_block_open = True
+    text_block_open = False
     current_text_index = 0
+    buffer_tool_text = bool(anchor_id and TOOL_SUPPORT)
 
     def sse(event_name: str, payload: Dict[str, Any]) -> str:
         return f"event: {event_name}\ndata: {ujson.dumps(payload, ensure_ascii=False)}\n\n"
@@ -2764,10 +2804,6 @@ async def stream_claude_message(
             },
         },
     )
-    yield sse(
-        "content_block_start",
-        {"type": "content_block_start", "index": current_text_index, "content_block": {"type": "text", "text": ""}},
-    )
 
     usage_obj: Dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
 
@@ -2781,23 +2817,23 @@ async def stream_claude_message(
                     if not isinstance(answer_delta, str):
                         answer_delta = str(answer_delta)
 
-                    if not text_block_open:
-                        current_text_index = content_index
-                        text_block_open = True
-                        yield sse(
-                            "content_block_start",
-                            {"type": "content_block_start", "index": current_text_index, "content_block": {"type": "text", "text": ""}},
-                        )
-
                     accumulated_text += answer_delta
-                    yield sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": current_text_index,
-                            "delta": {"type": "text_delta", "text": answer_delta},
-                        },
-                    )
+                    if not buffer_tool_text:
+                        if not text_block_open:
+                            current_text_index = content_index
+                            text_block_open = True
+                            yield sse(
+                                "content_block_start",
+                                {"type": "content_block_start", "index": current_text_index, "content_block": {"type": "text", "text": ""}},
+                            )
+                        yield sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": current_text_index,
+                                "delta": {"type": "text_delta", "text": answer_delta},
+                            },
+                        )
 
             elif event_type == "tool_calls":
                 dify_tool_calls = data.get("tool_calls", [])
@@ -2851,6 +2887,25 @@ async def stream_claude_message(
                     if extracted:
                         tool_calls_sent = True
                         extracted_tool_calls = _normalize_tool_calls(extracted)
+
+                if buffer_tool_text and not tool_calls_sent and accumulated_text:
+                    final_text = remove_tool_json_content(accumulated_text, anchor_id)
+                    if final_text:
+                        if not text_block_open:
+                            current_text_index = content_index
+                            text_block_open = True
+                            yield sse(
+                                "content_block_start",
+                                {"type": "content_block_start", "index": current_text_index, "content_block": {"type": "text", "text": ""}},
+                            )
+                        yield sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": current_text_index,
+                                "delta": {"type": "text_delta", "text": final_text},
+                            },
+                        )
 
                 if extracted_tool_calls:
                     if text_block_open:
@@ -2998,7 +3053,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
 
         resp = await model_manager.client.post(
             endpoint,
-            content=ujson.dumps(dify_req),
+            content=ujson.dumps(dify_req, ensure_ascii=False),
             headers=headers,
             timeout=TIMEOUT
         )

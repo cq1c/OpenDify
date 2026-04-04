@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
-
+import json_repair
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
@@ -83,7 +83,9 @@ POOL_SIZE = int(os.getenv("POOL_SIZE", "50"))
 # ── 请求/响应日志 ──
 REQUEST_LOG_ENABLED = _env_bool("REQUEST_LOG_ENABLED", False)
 REQUEST_LOG_DIR = os.getenv("REQUEST_LOG_DIR", "logs").strip()
-REQUEST_LOG_MAX_SIZE = int(os.getenv("REQUEST_LOG_MAX_SIZE", str(50 * 1024 * 1024)))  # 50MB
+REQUEST_LOG_MAX_SIZE = int(
+    os.getenv("REQUEST_LOG_MAX_SIZE", str(50 * 1024 * 1024))
+)  # 50MB
 REQUEST_LOG_BACKUP_COUNT = int(os.getenv("REQUEST_LOG_BACKUP_COUNT", "5"))
 REQUEST_LOG_MAX_BODY = int(os.getenv("REQUEST_LOG_MAX_BODY", "0"))  # 0=不截断
 
@@ -198,7 +200,9 @@ class RequestResponseLogger:
         entry: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "direction": "DIFY → PROXY",
-            "stage": "dify_response_stream_summary" if is_stream_summary else "dify_response",
+            "stage": (
+                "dify_response_stream_summary" if is_stream_summary else "dify_response"
+            ),
             "request_id": request_id,
             "status_code": status_code,
             "conversation_id": conversation_id,
@@ -516,8 +520,12 @@ def transform_openai_to_dify(
                 last_assistant_idx = idx
                 break
         system_msgs = [m for m in messages if (m or {}).get("role") == "system"]
-        delta_msgs = messages[last_assistant_idx + 1 :] if last_assistant_idx >= 0 else messages
-        selected = system_msgs + [m for m in delta_msgs if (m or {}).get("role") != "system"]
+        delta_msgs = (
+            messages[last_assistant_idx + 1 :] if last_assistant_idx >= 0 else messages
+        )
+        selected = system_msgs + [
+            m for m in delta_msgs if (m or {}).get("role") != "system"
+        ]
     elif ONLY_RECENT_MESSAGES > 0:
         system_msgs = [m for m in messages if (m or {}).get("role") == "system"]
         non_system = [m for m in messages if (m or {}).get("role") != "system"]
@@ -592,6 +600,18 @@ _TOOL_TAG_PATTERN = re.compile(
 )
 
 
+def _robut_json_loads(text: str) -> Optional[Any]:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json_repair.loads(text)
+    except Exception as e:
+        logger.warning(f"JSON repair failed: {e}")
+    return None
+
+
 def _robust_json_parse(text: str) -> Optional[Any]:
     text = text.strip()
     if not text:
@@ -599,15 +619,11 @@ def _robust_json_parse(text: str) -> Optional[Any]:
     fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     if fenced:
         text = fenced.group(1).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    if ret := _robut_json_loads(text):
+        return ret
     fixed = re.sub(r",\s*([}\]])", r"\1", text)
-    try:
-        return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
+    if ret := _robut_json_loads(fixed):
+        return ret
     stack: List[str] = []
     for ch in text:
         if ch in "[{":
@@ -617,15 +633,11 @@ def _robust_json_parse(text: str) -> Optional[Any]:
                 stack.pop()
     if stack:
         patched = text + "".join(reversed(stack))
-        try:
-            return json.loads(patched)
-        except json.JSONDecodeError:
-            pass
+        if ret := _robut_json_loads(patched):
+            return ret
         patched_fixed = re.sub(r",\s*([}\]])", r"\1", patched)
-        try:
-            return json.loads(patched_fixed)
-        except json.JSONDecodeError:
-            pass
+        if ret := _robut_json_loads(patched_fixed):
+            return ret
     return None
 
 
@@ -678,7 +690,9 @@ def extract_tool_calls(
         clean_text = text[:open_pos].rstrip()
         after_open = text[open_pos + len(tag_open) :]
         close_pos = after_open.find(tag_close)
-        json_part = after_open[:close_pos].strip() if close_pos >= 0 else after_open.strip()
+        json_part = (
+            after_open[:close_pos].strip() if close_pos >= 0 else after_open.strip()
+        )
         parsed = _robust_json_parse(json_part)
         if parsed is not None:
             calls = _normalize_tool_calls(parsed)
@@ -870,7 +884,9 @@ async def _stream_and_capture_cid(
                     sent_up_to = len(accumulated)
                     continue
 
-                safe_end = (len(accumulated) - HOLDBACK) if HOLDBACK > 0 else len(accumulated)
+                safe_end = (
+                    (len(accumulated) - HOLDBACK) if HOLDBACK > 0 else len(accumulated)
+                )
                 if safe_end > sent_up_to:
                     yield _chunk(delta_content=accumulated[sent_up_to:safe_end])
                     sent_up_to = safe_end
@@ -943,7 +959,11 @@ async def _stream_and_capture_cid(
                 )
 
                 # 记录最终发送给客户端的结果
-                clean_text, _ = extract_tool_calls(accumulated, tool_token) if tool_token else (accumulated, None)
+                clean_text, _ = (
+                    extract_tool_calls(accumulated, tool_token)
+                    if tool_token
+                    else (accumulated, None)
+                )
                 traffic_log.log_stream_complete(
                     request_id,
                     accumulated_text=clean_text,
@@ -1037,9 +1057,7 @@ async def verify_api_key(request: Request) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 
-def _raise_upstream_error(
-    status_code: int, body: bytes, request_id: str = ""
-) -> None:
+def _raise_upstream_error(status_code: int, body: bytes, request_id: str = "") -> None:
     try:
         err = json.loads(body or b"{}")
         msg = err.get("message", body.decode("utf-8", errors="ignore"))
@@ -1048,7 +1066,9 @@ def _raise_upstream_error(
         msg = body.decode("utf-8", errors="ignore") if body else "Upstream error"
         code = "upstream_error"
 
-    traffic_log.log_error(request_id, "dify_upstream", str(msg), status_code=status_code)
+    traffic_log.log_error(
+        request_id, "dify_upstream", str(msg), status_code=status_code
+    )
 
     if status_code == 429:
         etype = "rate_limit_error"
@@ -1123,7 +1143,9 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
 
     messages = openai_req.get("messages")
     if not isinstance(messages, list) or not messages:
-        raise APIError(400, "Missing 'messages'", code="missing_parameter", param="messages")
+        raise APIError(
+            400, "Missing 'messages'", code="missing_parameter", param="messages"
+        )
 
     # 记录 OpenAI 请求
     traffic_log.log_openai_request(request_id, model, openai_req)
@@ -1133,7 +1155,9 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         if len(MODEL_KEY_MAP) == 1:
             dify_key = next(iter(MODEL_KEY_MAP.values()))
         else:
-            raise APIError(404, f"Model '{model}' not found", code="model_not_found", param="model")
+            raise APIError(
+                404, f"Model '{model}' not found", code="model_not_found", param="model"
+            )
 
     system_text = ""
     for m in messages:
@@ -1143,7 +1167,9 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
 
     session = sessions.get(model, system_text)
 
-    explicit_cid = request.headers.get("X-Dify-Conversation-Id") or openai_req.get("conversation_id")
+    explicit_cid = request.headers.get("X-Dify-Conversation-Id") or openai_req.get(
+        "conversation_id"
+    )
     if isinstance(explicit_cid, str) and explicit_cid.strip():
         session["conversation_id"] = explicit_cid
 
@@ -1161,13 +1187,18 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         conversation_id=session.get("conversation_id"),
     )
 
-    headers = {"Authorization": f"Bearer {dify_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {dify_key}",
+        "Content-Type": "application/json",
+    }
     endpoint = f"{DIFY_API_BASE}/chat-messages"
     stream = bool(openai_req.get("stream", False))
 
     if stream:
         stream_opts = openai_req.get("stream_options") or {}
-        include_usage = bool(stream_opts.get("include_usage") if isinstance(stream_opts, dict) else False)
+        include_usage = bool(
+            stream_opts.get("include_usage") if isinstance(stream_opts, dict) else False
+        )
         message_id = f"chatcmpl-{_fast_id()}"
 
         cm = http_client.stream(

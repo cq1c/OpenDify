@@ -343,6 +343,10 @@ class SessionStore:
             "msg_count": 1,
             "prev_tokens": [],
             "last_non_system_count": 0,
+            # 累积 usage：在 conversation 模式下代表整个任务跨多轮的总 token 数。
+            "cum_prompt_tokens": 0,
+            "cum_completion_tokens": 0,
+            "cum_total_tokens": 0,
         }
         self._sessions[key] = session
         return session
@@ -374,8 +378,29 @@ class SessionStore:
             session["conversation_id"] = None
             session["msg_count"] = 1
             session["prev_tokens"] = []
+            session["cum_prompt_tokens"] = 0
+            session["cum_completion_tokens"] = 0
+            session["cum_total_tokens"] = 0
         session["last_non_system_count"] = non_system_msg_count
         return is_new_task
+
+    def accumulate_usage(
+        self, session: Dict[str, Any], usage: Dict[str, Any]
+    ) -> Dict[str, int]:
+        """把本轮 usage 累加到 session 的累计字段并返回累计值。"""
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        total = int(usage.get("total_tokens") or (prompt + completion))
+        session["cum_prompt_tokens"] = session.get("cum_prompt_tokens", 0) + prompt
+        session["cum_completion_tokens"] = (
+            session.get("cum_completion_tokens", 0) + completion
+        )
+        session["cum_total_tokens"] = session.get("cum_total_tokens", 0) + total
+        return {
+            "prompt_tokens": session["cum_prompt_tokens"],
+            "completion_tokens": session["cum_completion_tokens"],
+            "total_tokens": session["cum_total_tokens"],
+        }
 
 
 sessions = SessionStore()
@@ -809,6 +834,162 @@ def _robust_json_parse(text: str) -> Optional[Any]:
     return None
 
 
+def _coerce_value(value: Any, schema: Optional[Dict[str, Any]]) -> Any:
+    """
+    按 JSON schema 把 value 修复到期望类型。宽松——无法修复时原样返回。
+    覆盖弱模型最常见的错配：
+      - array<object> 收到 array<string>：用 required[0] 或第一个 property 包装
+      - array 收到单值：包成 [value]
+      - string/number/integer/boolean 常见跨类型
+    """
+    if not isinstance(schema, dict):
+        return value
+    t = schema.get("type")
+
+    if t == "array":
+        item_schema = schema.get("items") if isinstance(schema.get("items"), dict) else {}
+        if not isinstance(value, list):
+            value = [value]
+        return [_coerce_value(it, item_schema) for it in value]
+
+    if t == "object":
+        props = schema.get("properties") or {}
+        required = schema.get("required") or []
+        if isinstance(value, dict):
+            return {
+                k: (_coerce_value(v, props[k]) if k in props else v)
+                for k, v in value.items()
+            }
+        if isinstance(value, (str, int, float, bool)) and props:
+            wrap_key: Optional[str] = None
+            if required and required[0] in props:
+                wrap_key = required[0]
+            else:
+                wrap_key = next(iter(props.keys()))
+            sub = props.get(wrap_key, {})
+            return {wrap_key: _coerce_value(value, sub)}
+        return value
+
+    if t == "string":
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    if t in ("number", "integer"):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value) if t == "integer" else value
+        if isinstance(value, str):
+            s = value.strip()
+            try:
+                return int(s) if t == "integer" else float(s)
+            except ValueError:
+                try:
+                    # "1.0" -> int(1)
+                    return int(float(s)) if t == "integer" else float(s)
+                except ValueError:
+                    return value
+        return value
+
+    if t == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            s = value.strip().lower()
+            if s in ("true", "1", "yes", "y"):
+                return True
+            if s in ("false", "0", "no", "n", ""):
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return value
+
+    return value
+
+
+def _coerce_arguments(
+    args: Dict[str, Any], parameters_schema: Dict[str, Any]
+) -> Dict[str, Any]:
+    props = parameters_schema.get("properties") or {}
+    if not isinstance(props, dict) or not props:
+        return args
+    return {
+        k: (_coerce_value(v, props[k]) if k in props else v) for k, v in args.items()
+    }
+
+
+def _tools_by_name(
+    tools: Optional[List[Dict[str, Any]]]
+) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for t in tools or []:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            continue
+        fn = t.get("function") or {}
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name:
+            out[name] = fn
+    return out
+
+
+def _coerce_tool_calls_parsed(
+    parsed: Any, tools: Optional[List[Dict[str, Any]]]
+) -> Any:
+    """
+    在 normalize 之前把每个 tool_call 的 arguments 按对应工具 schema 修整。
+    处理 dict（含 tool_calls 键）、list 两种 parsed 形态。
+    """
+    if not tools or parsed is None:
+        return parsed
+
+    name_map = _tools_by_name(tools)
+    if not name_map:
+        return parsed
+
+    def _fix_one(call: Any) -> Any:
+        if not isinstance(call, dict):
+            return call
+        fn = call.get("function")
+        if not isinstance(fn, dict):
+            return call
+        name = fn.get("name")
+        spec = name_map.get(name) if name else None
+        if not isinstance(spec, dict):
+            return call
+        schema = spec.get("parameters") or {}
+        if not isinstance(schema, dict):
+            return call
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                return call
+        if not isinstance(args, dict):
+            return call
+        new_args = _coerce_arguments(args, schema)
+        new_call = dict(call)
+        new_fn = dict(fn)
+        new_fn["arguments"] = new_args
+        new_call["function"] = new_fn
+        return new_call
+
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("tool_calls"), list):
+            new = dict(parsed)
+            new["tool_calls"] = [_fix_one(c) for c in parsed["tool_calls"]]
+            return new
+        return _fix_one(parsed)
+    if isinstance(parsed, list):
+        return [_fix_one(c) for c in parsed]
+    return parsed
+
+
 def _normalize_tool_calls(raw: Any) -> List[Dict[str, Any]]:
     items: List[Any] = []
     if isinstance(raw, dict):
@@ -878,6 +1059,7 @@ def extract_tool_calls(
     text: str,
     token: Optional[str] = None,
     prev_tokens: Optional[List[str]] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
     """
     从模型输出中提取 tool_calls。宽松策略（弱模型友好）：
@@ -885,10 +1067,18 @@ def extract_tool_calls(
       2) 只有开始标签没有结束标签 → 取标签之后到末尾为 JSON
       3) 只有结束标签没有开始标签 → 向前找最近的合法 JSON 数组
       4) 两端都没有但末尾像合法的 tool_calls JSON 数组 → 宽松接受
+    若传入 tools，则按工具 parameters schema 修复 arguments 类型错配。
     对 token 只做"记录"，不做拒绝（弱模型常会抄错）。
     """
     if not text:
         return text or "", None
+
+    def _finalize(parsed: Any) -> Optional[List[Dict[str, Any]]]:
+        if parsed is None:
+            return None
+        parsed = _coerce_tool_calls_parsed(parsed, tools)
+        calls = _normalize_tool_calls(parsed)
+        return calls or None
 
     # ── 1) 完整标签对 ──
     match = _TOOL_TAG_PATTERN.search(text)
@@ -902,11 +1092,9 @@ def extract_tool_calls(
                     token,
                 )
         clean_text = text[: match.start()].rstrip()
-        parsed = _robust_json_parse(match.group(2))
-        if parsed is not None:
-            calls = _normalize_tool_calls(parsed)
-            if calls:
-                return clean_text, calls
+        calls = _finalize(_robust_json_parse(match.group(2)))
+        if calls:
+            return clean_text, calls
         return clean_text, None
 
     # ── 2) 有开始标签、无结束标签 ──
@@ -914,11 +1102,9 @@ def extract_tool_calls(
     if open_match:
         clean_text = text[: open_match.start()].rstrip()
         tail = text[open_match.end() :].strip()
-        parsed = _robust_json_parse(tail)
-        if parsed is not None:
-            calls = _normalize_tool_calls(parsed)
-            if calls:
-                return clean_text, calls
+        calls = _finalize(_robust_json_parse(tail))
+        if calls:
+            return clean_text, calls
 
     # ── 3) 无开始标签、有结束标签 ──
     close_pos = text.find(TOOL_CLOSE_TAG)
@@ -928,11 +1114,9 @@ def extract_tool_calls(
         span = _slice_balanced_array(before, last_bracket) if last_bracket >= 0 else None
         if span:
             start, end = span
-            parsed = _robust_json_parse(text[start:end])
-            if parsed is not None:
-                calls = _normalize_tool_calls(parsed)
-                if calls:
-                    return text[:start].rstrip(), calls
+            calls = _finalize(_robust_json_parse(text[start:end]))
+            if calls:
+                return text[:start].rstrip(), calls
 
     # ── 4) 两端都无但末尾有合法 tool_calls JSON ──
     last_bracket = text.rfind("]")
@@ -942,7 +1126,7 @@ def extract_tool_calls(
             start, end = span
             parsed = _robust_json_parse(text[start:end])
             if _looks_like_tool_calls(parsed):
-                calls = _normalize_tool_calls(parsed)
+                calls = _finalize(parsed)
                 if calls:
                     return text[:start].rstrip(), calls
 
@@ -962,11 +1146,13 @@ def build_openai_response(
     dify_resp: Dict[str, Any],
     model: str,
     tool_token: Optional[str] = None,
+    session: Optional[Dict[str, Any]] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     answer = dify_resp.get("answer", "")
     tool_calls: Optional[List[Dict[str, Any]]] = None
     if answer:
-        answer, tool_calls = extract_tool_calls(answer, tool_token)
+        answer, tool_calls = extract_tool_calls(answer, tool_token, tools=tools)
     message: Dict[str, Any] = {
         "role": "assistant",
         "content": answer.strip() if answer and answer.strip() else None,
@@ -980,6 +1166,17 @@ def build_openai_response(
     )
     if not isinstance(usage_raw, dict):
         usage_raw = {}
+
+    # conversation 模式下返回累积 usage，便于客户端正确显示任务级上下文占用。
+    if session is not None and CONVERSATION_MODE == "auto":
+        usage_out = sessions.accumulate_usage(session, usage_raw)
+    else:
+        usage_out = {
+            "prompt_tokens": int(usage_raw.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage_raw.get("completion_tokens") or 0),
+            "total_tokens": int(usage_raw.get("total_tokens") or 0),
+        }
+
     resp = {
         "id": f"chatcmpl-{_fast_id()}",
         "object": "chat.completion",
@@ -994,11 +1191,7 @@ def build_openai_response(
                 "logprobs": None,
             }
         ],
-        "usage": {
-            "prompt_tokens": usage_raw.get("prompt_tokens", 0),
-            "completion_tokens": usage_raw.get("completion_tokens", 0),
-            "total_tokens": usage_raw.get("total_tokens", 0),
-        },
+        "usage": usage_out,
     }
     return resp, dify_resp.get("conversation_id")
 
@@ -1043,6 +1236,7 @@ async def _stream_and_capture_cid(
     include_usage: bool,
     session: Dict[str, Any],
     request_id: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
 ) -> AsyncGenerator[str, None]:
     # 工具调用开始标签可能是：<tool-calls>、<tool-calls token="xxxx">
     # HOLDBACK 取最长可能的开始标签长度上限，保证流里不会提前暴露半截标签。
@@ -1143,14 +1337,19 @@ async def _stream_and_capture_cid(
                     else None
                 )
                 if isinstance(meta_usage, dict):
-                    usage_obj = {
-                        "prompt_tokens": meta_usage.get("prompt_tokens", 0),
-                        "completion_tokens": meta_usage.get("completion_tokens", 0),
-                        "total_tokens": meta_usage.get("total_tokens", 0),
-                    }
+                    if CONVERSATION_MODE == "auto":
+                        usage_obj = sessions.accumulate_usage(session, meta_usage)
+                    else:
+                        usage_obj = {
+                            "prompt_tokens": int(meta_usage.get("prompt_tokens") or 0),
+                            "completion_tokens": int(
+                                meta_usage.get("completion_tokens") or 0
+                            ),
+                            "total_tokens": int(meta_usage.get("total_tokens") or 0),
+                        }
 
                 if tool_mode:
-                    _, tool_calls = extract_tool_calls(accumulated, tool_token)
+                    _, tool_calls = extract_tool_calls(accumulated, tool_token, tools=tools)
                     if tool_calls:
                         final_tool_calls = tool_calls
                         final_finish_reason = "tool_calls"
@@ -1205,7 +1404,7 @@ async def _stream_and_capture_cid(
 
                 # 记录最终发送给客户端的结果
                 clean_text, _ = (
-                    extract_tool_calls(accumulated, tool_token)
+                    extract_tool_calls(accumulated, tool_token, tools=tools)
                     if tool_token
                     else (accumulated, None)
                 )
@@ -1412,22 +1611,29 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
 
     session = sessions.get(model, system_text)
 
-    non_system_count = sum(
-        1 for m in messages if isinstance(m, dict) and m.get("role") != "system"
-    )
-    is_new_task = sessions.maybe_reset_for_new_task(session, non_system_count)
-    if is_new_task:
-        logger.info(
-            "检测到新任务（消息数从 >1 回落到 %d），重置会话 key=%s",
-            non_system_count,
-            session["key"],
+    if CONVERSATION_MODE == "auto":
+        non_system_count = sum(
+            1 for m in messages if isinstance(m, dict) and m.get("role") != "system"
         )
-        # 新任务：丢弃历史 token，直接生成一个全新的
+        is_new_task = sessions.maybe_reset_for_new_task(session, non_system_count)
+        if is_new_task:
+            logger.info(
+                "检测到新任务（消息数从 >1 回落到 %d），重置会话 key=%s",
+                non_system_count,
+                session["key"],
+            )
+            # 新任务：丢弃历史 token，直接生成一个全新的
+            session["token"] = secrets.token_hex(3)
+            session["prev_tokens"] = []
+        elif session["msg_count"] > 1:
+            # 每次后续消息都轮换 token，提示词里会声明历史 token 全部作废
+            sessions.rotate_token(session)
+    else:
+        # 非 conversation 模式：每次都是全新对话，Dify 看不到历史。
+        # 历史 token 对模型毫无意义（它压根没见过），直接清空并换新 token。
         session["token"] = secrets.token_hex(3)
         session["prev_tokens"] = []
-    elif session["msg_count"] > 1:
-        # 每次后续消息都轮换 token，提示词里会声明历史 token 全部作废
-        sessions.rotate_token(session)
+        session["conversation_id"] = None
 
     explicit_cid = request.headers.get("X-Dify-Conversation-Id") or openai_req.get(
         "conversation_id"
@@ -1486,6 +1692,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
                 include_usage=include_usage,
                 session=session,
                 request_id=request_id,
+                tools=openai_req.get("tools") or None,
             ),
             media_type="text/event-stream",
             headers={
@@ -1517,7 +1724,13 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         conversation_id=dify_resp.get("conversation_id"),
     )
 
-    openai_resp, cid = build_openai_response(dify_resp, model, tool_token)
+    openai_resp, cid = build_openai_response(
+        dify_resp,
+        model,
+        tool_token,
+        session=session,
+        tools=openai_req.get("tools") or None,
+    )
 
     if cid:
         sessions.update_conversation_id(session, cid)

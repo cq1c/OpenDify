@@ -6,10 +6,12 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 
-from .config import CONVERSATION_MODE
+from .config import CONVERSATION_MODE, PROMPT_DIALECT
+from .dialects import get_dialect
 from .sessions import sessions
-from .tool_calls import extract_tool_calls
 from .utils import fast_id
+
+extract_tool_calls = get_dialect(PROMPT_DIALECT).extract_tool_calls
 
 
 def build_openai_response(

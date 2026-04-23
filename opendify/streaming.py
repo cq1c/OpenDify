@@ -6,11 +6,16 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 
-from .config import CONVERSATION_MODE, logger
+from .config import CONVERSATION_MODE, PROMPT_DIALECT, logger
+from .dialects import get_dialect
 from .responses import iter_dify_sse
 from .sessions import sessions
-from .tool_calls import TOOL_OPEN_TAG_PATTERN, extract_tool_calls
 from .traffic_log import traffic_log
+
+_dialect = get_dialect(PROMPT_DIALECT)
+TOOL_OPEN_TAG_PATTERN = _dialect.OPEN_TAG_PATTERN
+extract_tool_calls = _dialect.extract_tool_calls
+_DIALECT_HOLDBACK = getattr(_dialect, "HOLDBACK", 40)
 
 
 async def stream_and_capture_cid(
@@ -27,7 +32,7 @@ async def stream_and_capture_cid(
     # 工具调用开始标签可能是：<tool-calls>、<tool-calls token="xxxx">
     # HOLDBACK 取最长可能的开始标签长度上限，保证流里不会提前暴露半截标签。
     detect_tool_tags = tool_token is not None
-    HOLDBACK = 40 if detect_tool_tags else 0
+    HOLDBACK = _DIALECT_HOLDBACK if detect_tool_tags else 0
 
     accumulated = ""
     sent_up_to = 0

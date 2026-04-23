@@ -66,6 +66,15 @@ ONLY_RECENT_MESSAGES = int(os.getenv("ONLY_RECENT_MESSAGES", "0"))
 CONVERSATION_MODE = os.getenv("CONVERSATION_MODE", "auto").strip().lower()
 
 
+# ── 提示词方言 ──
+# generic = `[Role]:` + `<tool-calls>[JSON]</tool-calls>` (默认, 最泛化)
+# claude  = `<system>/<user>/<assistant>` + `<function_calls><invoke>` (Anthropic 原生方言)
+# openai  = ChatML `<|im_start|>` + `<tool_call>{JSON}</tool_call>` (Hermes/Qwen 风格)
+PROMPT_DIALECT = os.getenv("PROMPT_DIALECT", "generic").strip().lower()
+if PROMPT_DIALECT not in ("generic", "claude", "openai"):
+    PROMPT_DIALECT = "generic"
+
+
 # ── 工具调用强度分级（0~6） ──
 # 0=off  1=polite(当前默认)  2=assertive  3=aggressive  4=nuclear
 # 5=savage(脏话发泄, 仅本地调试)  6=classical(文言文劝谏体)

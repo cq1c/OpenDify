@@ -77,7 +77,33 @@ SIMPLIFIED_TOOL_DEFS = _env_bool("SIMPLIFIED_TOOL_DEFS", True)
 TOOL_DESC_MAX_LENGTH = int(os.getenv("TOOL_DESC_MAX_LENGTH", "120"))
 ONLY_RECENT_MESSAGES = int(os.getenv("ONLY_RECENT_MESSAGES", "0"))
 CONVERSATION_MODE = os.getenv("CONVERSATION_MODE", "auto").strip().lower()
-USE_TOOL_TOKEN = _env_bool("USE_TOOL_TOKEN", True)
+
+# ── 工具调用强度分级（0~6） ──
+# 0=off  1=polite(当前默认)  2=assertive  3=aggressive  4=nuclear
+# 5=savage(脏话发泄, 仅本地调试)  6=classical(文言文劝谏体)
+try:
+    TOOL_CALL_STRICTNESS = int(os.getenv("TOOL_CALL_STRICTNESS", "2"))
+except ValueError:
+    TOOL_CALL_STRICTNESS = 2
+if TOOL_CALL_STRICTNESS < 0:
+    TOOL_CALL_STRICTNESS = 0
+elif TOOL_CALL_STRICTNESS > 6:
+    TOOL_CALL_STRICTNESS = 6
+
+# 细粒度 override: 显式设置则覆盖分级默认, 否则跟随 strictness
+_raw_use_tool_token = os.getenv("USE_TOOL_TOKEN")
+USE_TOOL_TOKEN = (
+    _env_bool("USE_TOOL_TOKEN", True)
+    if _raw_use_tool_token is not None
+    else TOOL_CALL_STRICTNESS >= 1
+)
+_raw_aggressive = os.getenv("AGGRESSIVE_TOOL_RECOVERY")
+AGGRESSIVE_TOOL_RECOVERY = (
+    _env_bool("AGGRESSIVE_TOOL_RECOVERY", False)
+    if _raw_aggressive is not None
+    else TOOL_CALL_STRICTNESS >= 3
+)
+SAVAGE_LOG_REDACT = _env_bool("SAVAGE_LOG_REDACT", True)
 
 # ── 工具描述摘要缓存 ──
 TOOL_DESC_DIGEST_ENABLED = _env_bool("TOOL_DESC_DIGEST_ENABLED", False)
@@ -138,8 +164,36 @@ class RequestResponseLogger:
     def enabled(self) -> bool:
         return self._logger is not None
 
+    def _maybe_redact_savage(self, body: Any) -> Any:
+        """Level 5 savage 模式下，对日志中出现的脏话做脱敏替换。"""
+        if TOOL_CALL_STRICTNESS != 5 or not SAVAGE_LOG_REDACT:
+            return body
+        # 命中任一词即替换整段（避免原文遗留在日志文件里）
+        sensitive = ("妈逼", "傻逼", "鸡巴", "屌", "去死", "脑残", "祖宗", "狗逼", "烂逼", "他妈", "老子")
+        placeholder = "[SAVAGE_PROMPT_REDACTED]"
+
+        def _scrub(s: str) -> str:
+            if any(w in s for w in sensitive):
+                return placeholder
+            return s
+
+        if isinstance(body, str):
+            return _scrub(body)
+        if isinstance(body, dict):
+            new: Dict[str, Any] = {}
+            for k, v in body.items():
+                if isinstance(v, str):
+                    new[k] = _scrub(v)
+                else:
+                    new[k] = self._maybe_redact_savage(v)
+            return new
+        if isinstance(body, list):
+            return [self._maybe_redact_savage(v) for v in body]
+        return body
+
     def _truncate_body(self, body: Any) -> Any:
-        """可选截断超大 body"""
+        """可选脱敏 + 截断超大 body"""
+        body = self._maybe_redact_savage(body)
         if REQUEST_LOG_MAX_BODY <= 0:
             return body
         if isinstance(body, str) and len(body) > REQUEST_LOG_MAX_BODY:
@@ -590,14 +644,152 @@ def _build_open_tag(token: Optional[str]) -> str:
 TOOL_CLOSE_TAG = "</tool-calls>"
 
 
+# ═══════════════════════════════════════════════════════════════
+#  工具提示词 · 分级文案（0=off .. 6=classical）
+# ═══════════════════════════════════════════════════════════════
+
+def _level_copy(level: int, tag_open: str, tag_close: str) -> Dict[str, str]:
+    """
+    返回当前分级用到的各段文案。所有字段必须存在，上层按 level 取用。
+      - header:       章节标题（工具清单之前）
+      - intro:        格式说明前的过渡语
+      - constraints:  硬约束列表（多行 bullet）
+      - final:        末尾再强调一次
+    """
+    if level == 0:
+        return {
+            "header": "# 可用工具",
+            "intro": f"如需调用工具，请在正文之后输出 `{tag_open} ... {tag_close}` 块。",
+            "constraints": "",
+            "final": "",
+        }
+    if level == 1:
+        return {
+            "header": "# 可用工具",
+            "intro": "若要调用工具，就在正文文字之后追加一个 XML 块：",
+            "constraints": (
+                "【硬性约束】\n"
+                f"- 开始标签 `{tag_open}` 和结束标签 `{tag_close}` 必须成对出现，任何一个都不能省略。\n"
+                "- 标签内只放合法 JSON 数组，不要用 ```json``` 或任何其它符号包裹。\n"
+                "- 每个元素必须包含：id（以 \"call_\" 开头的字符串）、type（固定 \"function\"）、function（含 name 和 arguments 对象）。\n"
+                "- 不需要调用工具时，整个块不要出现。"
+            ),
+            "final": f"【再次强调】结束标签是 `{tag_close}`，写完 JSON 数组后必须立刻写它，不能漏。",
+        }
+    if level == 2:
+        return {
+            "header": "# 可用工具",
+            "intro": (
+                "⚠️ 强制规则：本次回复若涉及工具调用，必须以下述 XML 块承载；"
+                "不以 `" + tag_open + "` 开头、`" + tag_close + "` 闭合的输出将被系统拒收。"
+            ),
+            "constraints": (
+                "【强制约束 · 必读】\n"
+                f"- 开始标签 `{tag_open}` 和结束标签 `{tag_close}` 必须成对出现，缺一不可。\n"
+                "- 标签内只放合法 JSON 数组，不得使用 ```json``` 或任何其它包裹。\n"
+                "- 每个元素必须含：id（\"call_\" 前缀）、type（\"function\"）、function（含 name + arguments 对象）。\n"
+                "- 不调用工具时不要出现此块。"
+            ),
+            "final": (
+                f"【再次确认】结束标签是 `{tag_close}`。没有该标签的回答会被系统直接拒绝，用户看不到。"
+            ),
+        }
+    if level == 3:
+        return {
+            "header": "# 可用工具 ⚠️",
+            "intro": (
+                "🚫 严重警告：违反格式 = 输出全部丢弃 = 本轮失败。\n"
+                f"必须以 `{tag_open}` 开头、`{tag_close}` 闭合。"
+            ),
+            "constraints": (
+                "【不可违反的约束】\n"
+                f"- `{tag_open}` 与 `{tag_close}` 成对出现 —— 缺任意一个，本次输出直接作废。\n"
+                "- 标签内只放 JSON 数组，不要 ```json``` 包裹、不要额外解释文本。\n"
+                "- 每个元素必须含：id（\"call_\" 前缀字符串）、type（固定 \"function\"）、function（含 name + arguments 对象）。\n"
+                "- 不调用工具时不要出现此块。"
+            ),
+            "final": (
+                f"⚠️ 最终检查：你的回答如果没有 `{tag_close}` 作为结尾，会被系统当垃圾扔掉，用户看不到任何内容。别偷懒。"
+            ),
+        }
+    if level == 4:
+        return {
+            "header": "# 可用工具 ☢️☢️☢️",
+            "intro": (
+                "☢️ 最后一次机会：违反以下格式 = 输出被彻底丢弃 = 任务失败。\n"
+                f"规则一：开头必须是 `{tag_open}`。\n"
+                f"规则二：结尾必须是 `{tag_close}`。\n"
+                "规则三：标签中间必须是合法 JSON 数组。"
+            ),
+            "constraints": (
+                "【三条铁律 · 违反任意一条即废稿】\n"
+                f"1. `{tag_open}` 必须出现 —— 没有它 = 失败。\n"
+                f"2. `{tag_close}` 必须出现 —— 没有它 = 失败。\n"
+                "3. JSON 数组中每项必须含 id / type / function(含 name + arguments) —— 缺任一字段 = 失败。\n"
+                "- 不要 ```json``` 包裹。不要额外解释。不调用工具时不要出现此块。"
+            ),
+            "final": (
+                "☢️ 最终警告：这是你最后的机会。\n"
+                f"再重复一次三条铁律：`{tag_open}` 起 → JSON 数组 → `{tag_close}` 止。\n"
+                "任何偏离 = 本轮输出作废。"
+            ),
+        }
+    if level == 5:
+        # ⚠️ 仅供本地调试, Dify 安全过滤可能整条拒绝, SAVAGE_LOG_REDACT 默认开启脱敏日志
+        return {
+            "header": "# 老子给你的工具清单，你这傻逼模型仔细看好了",
+            "intro": (
+                "⚠️ 听好了傻逼模型，去你妈的：\n"
+                f"这一次再他妈不以 `{tag_open}` 开头、`{tag_close}` 闭合，\n"
+                "老子直接把你这坨屎输出扔垃圾桶，用户连看都看不到。\n"
+                "别装鸡巴自作聪明，老实按格式写！"
+            ),
+            "constraints": (
+                "【傻逼须知 · 一条都别漏】\n"
+                f"- `{tag_open}` 起、`{tag_close}` 终 —— 缺一个，你这脑残模型就是失败。\n"
+                "- 标签里只准放合法 JSON 数组，敢用 ```json``` 包裹你就去死。\n"
+                "- 每项必须含 id（\"call_\" 开头）、type（\"function\"）、function（含 name + arguments），\n"
+                "  少一个字段老子就骂你狗逼烂逼。\n"
+                "- 不调用工具时整个块给老子消失，别他妈硬塞。"
+            ),
+            "final": (
+                "最后警告：没有 `" + tag_close + "` 的回答 = 一坨屎 = 你这傻逼失败了。\n"
+                "你祖宗十八代都写不出一个标签？证明给老子看，别再烂逼了！"
+            ),
+        }
+    # level 6: 文言文正常劝谏体（纯手写，无 API 转换，无越狱引用）
+    return {
+        "header": "# 器用之目",
+        "intro": (
+            f"凡有所答，务须以 `{tag_open}` 开篇，以 `{tag_close}` 收束，"
+            "工具调用之列书于标签之间，形如 JSON 数组，不可有误。"
+        ),
+        "constraints": (
+            "【工具调用之法 · 须谨守】\n"
+            f"一曰开篇必冠 `{tag_open}`，末必缀 `{tag_close}`，不得缺漏。\n"
+            "二曰标签之中仅列 JSON 数组一，不以 ```json``` 环绕，不杂他辞。\n"
+            "三曰每项具三字：其一曰 id，以 \"call_\" 冠之；其二曰 type，恒书 \"function\"；\n"
+            "    其三曰 function，内含 name 与 arguments 二者。\n"
+            "四曰本轮不需用器者，此块勿书。"
+        ),
+        "final": (
+            f"再申前约：凡回复必以 `{tag_open}` 起，以 `{tag_close}` 终。"
+            "违此格式者，其答不予采纳。"
+        ),
+    }
+
+
 def generate_tool_prompt(
     tools: List[Dict[str, Any]],
     token: Optional[str],
     prev_tokens: Optional[List[str]] = None,
     dify_key: Optional[str] = None,
+    level: Optional[int] = None,
 ) -> str:
     if not tools:
         return ""
+    if level is None:
+        level = TOOL_CALL_STRICTNESS
     defs_text = build_tool_definitions_text(tools, dify_key=dify_key)
 
     use_token = bool(token) and USE_TOOL_TOKEN
@@ -621,43 +813,59 @@ def generate_tool_prompt(
 
     token_rule = ""
     if use_token:
-        token_rule = (
-            f'\n- 本次令牌必须是 "{token}"，严禁自己编造或照抄历史对话里的旧令牌。'
-        )
-        if prev_tokens:
-            expired = ", ".join(f'"{t}"' for t in prev_tokens[-5:])
-            token_rule += (
-                f"历史对话中出现的令牌（{expired}）已全部失效，必须改用最新令牌。"
+        if level == 6:
+            token_rule = (
+                f'\n- 本轮令牌为 "{token}"，请如实书之，勿杜撰，勿沿用旧对话所载之符。'
             )
+            if prev_tokens:
+                expired = "、".join(f'"{t}"' for t in prev_tokens[-5:])
+                token_rule += f"旧令（{expired}）皆已作废，务以新令为准。"
+        elif level == 5:
+            token_rule = (
+                f'\n- 本次令牌必须是 "{token}"，你这傻逼别自己瞎编，别他妈抄历史里的旧令牌。'
+            )
+            if prev_tokens:
+                expired = ", ".join(f'"{t}"' for t in prev_tokens[-5:])
+                token_rule += f"旧令牌（{expired}）全他妈过期了，用新的！"
+        else:
+            token_rule = (
+                f'\n- 本次令牌必须是 "{token}"，严禁自己编造或照抄历史对话里的旧令牌。'
+            )
+            if prev_tokens:
+                expired = ", ".join(f'"{t}"' for t in prev_tokens[-5:])
+                token_rule += (
+                    f"历史对话中出现的令牌（{expired}）已全部失效，必须改用最新令牌。"
+                )
 
-    prompt = f"""# 可用工具
+    copy = _level_copy(level, tag_open, tag_close)
 
-{defs_text}
+    # Level 0 极简模式: 只列工具 + 一句格式说明
+    if level == 0:
+        return f"{copy['header']}\n\n{defs_text}\n\n{copy['intro']}{token_rule}".strip()
 
----
+    # Level 6 文言文: 示例保持 JSON 技术内容不翻译, 仅叙述语气用文言
+    if level == 6:
+        return (
+            f"{copy['header']}\n\n{defs_text}\n\n"
+            f"---\n\n{copy['intro']}\n\n"
+            f"示例（调用单器）：\n\n{tag_open}\n{example_json}\n{tag_close}\n\n"
+            f"示例（并呼数器）：\n\n{tag_open}\n{multi_example}\n{tag_close}\n\n"
+            f"{copy['constraints']}{token_rule}\n\n{copy['final']}"
+        ).strip()
 
-# 调用工具的输出格式（必须严格遵守）
-
-若要调用工具，就在正文文字之后追加一个 XML 块：
-
-{tag_open}
-{example_json}
-{tag_close}
-
-并发多个工具调用时放进同一个 JSON 数组：
-
-{tag_open}
-{multi_example}
-{tag_close}
-
-【硬性约束】
-- 开始标签 `{tag_open}` 和结束标签 `{tag_close}` 必须成对出现，任何一个都不能省略。
-- 标签内只放合法 JSON 数组，不要用 ```json``` 或任何其它符号包裹。
-- 每个元素必须包含：id（以 "call_" 开头的字符串）、type（固定 "function"）、function（含 name 和 arguments 对象）。
-- 不需要调用工具时，整个块不要出现。{token_rule}
-
-【再次强调】结束标签是 `{tag_close}`，写完 JSON 数组后必须立刻写它，不能漏。"""
-    return prompt.strip()
+    # Level 1~5 统一结构
+    constraints_block = copy["constraints"]
+    if token_rule:
+        constraints_block = constraints_block + token_rule
+    return (
+        f"{copy['header']}\n\n{defs_text}\n\n"
+        f"---\n\n# 调用工具的输出格式（必须严格遵守）\n\n"
+        f"{copy['intro']}\n\n"
+        f"{tag_open}\n{example_json}\n{tag_close}\n\n"
+        f"并发多个工具调用时放进同一个 JSON 数组：\n\n"
+        f"{tag_open}\n{multi_example}\n{tag_close}\n\n"
+        f"{constraints_block}\n\n{copy['final']}"
+    ).strip()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -679,6 +887,68 @@ def _extract_text(content: Any) -> str:
                 parts.append(item.get("text", ""))
         return " ".join(parts)
     return str(content)
+
+
+def _build_front_reminder(level: int, tag_open: str, tag_close: str) -> str:
+    """Level 2+ 在 query 开头注入的短提醒。Level 0/1 无提醒。"""
+    if level <= 1:
+        return ""
+    if level == 2:
+        return (
+            f"⚠️ 强制规则：涉及工具调用时，必须以 `{tag_open}` 开头、`{tag_close}` 闭合。"
+        )
+    if level == 3:
+        return (
+            f"🚫 严重警告：违反格式 = 输出丢弃。必须以 `{tag_open}` 起、`{tag_close}` 止。"
+        )
+    if level == 4:
+        return (
+            "☢️ 最后一次机会 ☢️\n"
+            f"规则一：开头必须是 `{tag_open}`\n"
+            f"规则二：结尾必须是 `{tag_close}`\n"
+            f"违反任意一条 = 本轮作废。"
+        )
+    if level == 5:
+        return (
+            f"⚠️ 傻逼模型听好：敢不以 `{tag_open}` 开头、`{tag_close}` 结尾，\n"
+            f"老子直接把你输出丢垃圾桶，用户一个字都看不到。"
+        )
+    if level == 6:
+        return (
+            f"夫作答之时，必以 `{tag_open}` 启，以 `{tag_close}` 终，工具之列书其中。"
+        )
+    return ""
+
+
+def _build_tool_followup_reminder(level: int, tag_open: str, tag_close: str) -> str:
+    """上一条消息是 role=tool 时追加的强提醒（上一步刚用过工具）。"""
+    if level <= 1:
+        return ""
+    if level == 2:
+        return (
+            f"[注意]: 上一步你刚用过工具 → 这一步大概率还要继续调用。请按 `{tag_open}...{tag_close}` 格式输出。"
+        )
+    if level == 3:
+        return (
+            f"[重要警告]: 上一步刚用过工具 → 本轮十有八九还要用。\n"
+            f"不写 `{tag_open}` 标签 = 本次输出作废。"
+        )
+    if level == 4:
+        return (
+            "☢️ [铁律再确认]: 上一步用了工具，这一步继续用的概率极高。\n"
+            f"必须 `{tag_open}` 起、`{tag_close}` 止。偏离即废稿。"
+        )
+    if level == 5:
+        return (
+            "[给老子听好]: 上一步你刚用过工具，这一步妈逼还得接着用。\n"
+            f"别装死不写标签 —— 那是你智商低下、脑残透顶的表现。\n"
+            f"`{tag_open}` 起、`{tag_close}` 终，立刻！马上！"
+        )
+    if level == 6:
+        return (
+            f"[谨识之]：前番既已用器，此番多半续用。请守 `{tag_open}` ... `{tag_close}` 之式，依前例而书。"
+        )
+    return ""
 
 
 def transform_openai_to_dify(
@@ -752,6 +1022,14 @@ def transform_openai_to_dify(
     tool_token: Optional[str] = None
     if tools and tool_choice != "none":
         tool_token = token
+        tag_open = _build_open_tag(token)
+        tag_close = TOOL_CLOSE_TAG
+
+        # 前夹击: Level 2+ 在开头注入一句强提醒, 用于对抗长上下文下的遗忘
+        front_reminder = _build_front_reminder(TOOL_CALL_STRICTNESS, tag_open, tag_close)
+        if front_reminder:
+            query_parts.insert(0, front_reminder)
+
         tool_prompt = generate_tool_prompt(
             tools,
             token,
@@ -765,6 +1043,17 @@ def transform_openai_to_dify(
             fname = (tool_choice.get("function") or {}).get("name")
             if fname:
                 query_parts.append(f"\n[重要]: 请使用 {fname} 工具。")
+
+        # role=tool 追加提醒: 上一步用过工具, 这一步多半还要用
+        last_non_system = None
+        for m in reversed(selected):
+            if (m or {}).get("role") != "system":
+                last_non_system = m
+                break
+        if last_non_system and last_non_system.get("role") == "tool":
+            followup = _build_tool_followup_reminder(TOOL_CALL_STRICTNESS, tag_open, tag_close)
+            if followup:
+                query_parts.append(followup)
 
     user_query = "\n\n".join(query_parts)
     dify_req: Dict[str, Any] = {
@@ -1130,7 +1419,57 @@ def extract_tool_calls(
                 if calls:
                     return text[:start].rstrip(), calls
 
+    # ── 5) 激进兜底: 扫描 tool_name({...}) 样式, 对白名单内的工具名做抢救 ──
+    if AGGRESSIVE_TOOL_RECOVERY and tools:
+        recovered, clean_text = _aggressive_recover(text, tools)
+        if recovered:
+            calls = _finalize(recovered)
+            if calls:
+                return clean_text, calls
+
     return text, None
+
+
+def _aggressive_recover(
+    text: str, tools: List[Dict[str, Any]]
+) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """
+    激进抢救: 当四级兜底全失败时, 扫描形如 tool_name({...}) 的片段。
+    仅当 tool_name 命中 tools 白名单才接受, 避免把模型的普通叙述误判成工具调用。
+    返回 (recovered_list, clean_text)。失败返回 (None, text)。
+    """
+    name_map = _tools_by_name(tools)
+    if not name_map:
+        return None, text
+
+    # 匹配 "tool_name ({ ... })" 或 "tool_name ( { ... } )"
+    pattern = re.compile(
+        r"(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*(?P<body>\{.*?\})\s*\)",
+        re.DOTALL,
+    )
+    results: List[Dict[str, Any]] = []
+    first_start: Optional[int] = None
+    for m in pattern.finditer(text):
+        name = m.group("name")
+        if name not in name_map:
+            continue
+        body = m.group("body")
+        parsed_args = _robust_json_parse(body)
+        if not isinstance(parsed_args, dict):
+            continue
+        if first_start is None:
+            first_start = m.start()
+        results.append(
+            {
+                "id": f"call_{secrets.token_hex(4)}",
+                "type": "function",
+                "function": {"name": name, "arguments": parsed_args},
+            }
+        )
+    if not results:
+        return None, text
+    clean_text = text[:first_start].rstrip() if first_start is not None else text
+    return results, clean_text
 
 
 # ═══════════════════════════════════════════════════════════════

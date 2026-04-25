@@ -6,7 +6,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 
-from .config import CONVERSATION_MODE, PROMPT_DIALECT, logger
+from .config import AUTO_USAGE_MODE, CONVERSATION_MODE, PROMPT_DIALECT, logger
 from .dialects import get_dialect
 from .responses import iter_dify_sse
 from .sessions import sessions
@@ -130,7 +130,22 @@ async def stream_and_capture_cid(
                 )
                 if isinstance(meta_usage, dict):
                     if CONVERSATION_MODE == "auto":
-                        usage_obj = sessions.accumulate_usage(session, meta_usage)
+                        if AUTO_USAGE_MODE == "passthrough":
+                            usage_obj = {
+                                "prompt_tokens": int(
+                                    meta_usage.get("prompt_tokens") or 0
+                                ),
+                                "completion_tokens": int(
+                                    meta_usage.get("completion_tokens") or 0
+                                ),
+                                "total_tokens": int(
+                                    meta_usage.get("total_tokens") or 0
+                                ),
+                            }
+                        else:
+                            usage_obj = sessions.accumulate_usage(
+                                session, meta_usage
+                            )
                     else:
                         # 非 conversation 模式: 上游每轮独立, prompt_tokens 容易随
                         # Dify 内部模板抖动。优先用本地基于 query 文本计算的稳定值,

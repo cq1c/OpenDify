@@ -6,7 +6,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 
-from .config import CONVERSATION_MODE, PROMPT_DIALECT
+from .config import AUTO_USAGE_MODE, CONVERSATION_MODE, PROMPT_DIALECT
 from .dialects import get_dialect
 from .sessions import sessions
 from .utils import fast_id
@@ -41,8 +41,19 @@ def build_openai_response(
         usage_raw = {}
 
     # conversation 模式下返回累积 usage，便于客户端正确显示任务级上下文占用。
-    if session is not None and CONVERSATION_MODE == "auto":
+    if (
+        session is not None
+        and CONVERSATION_MODE == "auto"
+        and AUTO_USAGE_MODE == "accumulate"
+    ):
         usage_out = sessions.accumulate_usage(session, usage_raw)
+    elif CONVERSATION_MODE == "auto":
+        # auto + passthrough: 透传 Dify 当轮 usage, 反映当前上下文窗口大小
+        usage_out = {
+            "prompt_tokens": int(usage_raw.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage_raw.get("completion_tokens") or 0),
+            "total_tokens": int(usage_raw.get("total_tokens") or 0),
+        }
     else:
         # 非 conversation 模式: prompt_tokens 用本地估算稳住, 避免随上游波动。
         upstream_prompt = int(usage_raw.get("prompt_tokens") or 0)

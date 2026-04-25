@@ -65,6 +65,17 @@ TOOL_DESC_MAX_LENGTH = int(os.getenv("TOOL_DESC_MAX_LENGTH", "120"))
 ONLY_RECENT_MESSAGES = int(os.getenv("ONLY_RECENT_MESSAGES", "0"))
 CONVERSATION_MODE = os.getenv("CONVERSATION_MODE", "auto").strip().lower()
 
+# CONVERSATION_MODE=auto 下 prompt_tokens 的处理:
+#   accumulate (默认, 旧行为): 每轮 Dify 报数累加, 反映"任务级累计输入计费"。
+#                              注意: 若 Dify 已把全历史算进每轮 prompt_tokens,
+#                              累加会双重计数, 上下文显示会涨得飞快 (O(n²))。
+#   passthrough             : 直接透传 Dify 当轮报数, 反映"当前上下文窗口大小"。
+#                              推荐在 Dify 报数已含全历史的版本上使用。
+# completion_tokens 始终按 AUTO_USAGE_ACCUMULATE 一致策略处理 (输出不重复, 累加无害)。
+AUTO_USAGE_MODE = os.getenv("AUTO_USAGE_MODE", "accumulate").strip().lower()
+if AUTO_USAGE_MODE not in ("accumulate", "passthrough"):
+    AUTO_USAGE_MODE = "accumulate"
+
 
 # ── 提示词方言 ──
 # generic = `[Role]:` + `<tool-calls>[JSON]</tool-calls>` (默认, 最泛化)

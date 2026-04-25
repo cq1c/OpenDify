@@ -1,178 +1,360 @@
-# OpenDify
+# OpenDify Lite
 
-把 Dify 应用通过一个轻量代理暴露为多种兼容接口，方便直接用现有 SDK/生态调用。
+> 把 Dify 应用通过一个轻量代理暴露为 OpenAI 兼容的 ChatCompletion API，让你用熟悉的 SDK/生态调用 Dify 的能力。
+>
+> 特别优化：为弱模型设计的工具调用强制约束系统，从 "礼貌提示" 到 "文言文劝谏" 六个档位可选。
 
-## 支持的接口
+## 功能特性
 
-- `POST /v1/chat/completions`
-- `POST /anthropic/v1/chat/completions`（可选：OpenAI Chat Completions -> Anthropic Messages；需配置 `ANTHROPIC_API_KEY`）
-- `POST /v1/responses`
-- `POST /v1/messages`（Claude / Anthropic Messages -> Dify）
-- `POST /v1/messages/count_tokens`（Claude / Anthropic Token Count）
-- `POST /anthropic/v1/messages`（2anthropic：Claude Code / Anthropic SDK -> OpenAI Chat Completions 上游；未配置上游则 fallback 到 Dify）
-- `POST /anthropic/v1/messages/count_tokens`
-- `GET /anthropic/v1/models`
-- `GET /anthropic/v1/models/{model_id}`
-- `GET /v1/models`
-- `GET /v1/models/{model_id}`
+### 🎯 核心能力
+
+- **OpenAI 兼容接口** — 标准 `/v1/chat/completions`，直接替换 `base_url` 即可用
+- **多 Dify 应用映射** — 一个代理后端可绑定多个 Dify 应用，通过 `model` 参数路由
+- **完整工具调用支持** — `tools` / `tool_choice` 完整支持，确保弱模型也能按格式输出
+- **流式响应** — 支持 SSE 流式输出，可带 `stream_options` 返回 usage
+- **会话管理** — 自动追踪 Dify `conversation_id`，支持长对话记忆与 usage 累积
+- **多种提示词方言** — Generic / Claude / OpenAI 三种渲染模式，适配不同模型
+
+### 🛡️ 工具调用约束系统（专为弱模型设计）
+
+| 级别 | 名称 | 适用场景 | 特点 |
+|------|------|----------|------|
+| 0 | off | 强模型（GPT-4 / Claude） | 极简提示，不加任何警告 |
+| 1 | polite | 中等模型 | 结尾加硬约束列表 |
+| 2 | assertive | 弱模型（默认） | 强命令式 + 前后夹击 + role=tool 追加提醒 |
+| 3 | aggressive | 非常弱的模型 | + 后果警告 "输出将被丢弃" |
+| 4 | nuclear | 救命稻草 | + 规则重复 + "最后一次机会" |
+| 5 | savage | 本地调试 | 脏话发泄模式（日志自动脱敏） |
+| 6 | classical | 文言文爱好者 | 劝谏体，非辱骂，实验档位 |
+
+### 📦 优化特性
+
+- **令牌防串扰** — 每轮对话生成唯一 token 嵌入标签，防止旧对话干扰
+- **提示词裁剪** — 可配置系统提示词截断、仅保留最近 N 条消息
+- **工具描述摘要** — 实验功能：后台异步生成极简工具描述缓存，缩短上下文
+- **流量日志** — 可选记录完整请求/响应流程，便于调试
+- **连接池** — 配置化 HTTP 连接池，提升并发性能
 
 ## 快速开始
 
+### 安装依赖
+
 ```bash
 pip install -r requirements.txt
+```
+
+### 配置环境
+
+```bash
 cp .env.example .env
+# 编辑 .env 填入你的配置
+```
+
+**最小配置示例：**
+
+```env
+# 认证
+VALID_API_KEYS=sk-your-secret-key
+AUTH_MODE=required
+
+# Dify 配置
+DIFY_API_KEY=app-xxxxxxxxxxxxxxxx
+DIFY_MODEL_NAME=my-dify-app
+```
+
+### 启动服务
+
+```bash
 python app.py
 ```
 
-默认监听：`http://127.0.0.1:8000`
+服务默认监听：`http://127.0.0.1:8000`
 
-## 配置（.env）
+### 使用示例
 
-| 变量 | 必需 | 默认值 | 说明 |
-|---|---:|---|---|
-| `AUTH_MODE` | 否 | `required` | `required` 校验 `Authorization`；`disabled` 不校验（仅建议内网） |
-| `VALID_API_KEYS` | 否* | - | 代理层 API Key（逗号分隔）；`AUTH_MODE=required` 时必填 |
-| `DIFY_API_BASE` | 否 | `https://api.dify.ai/v1` | Dify API Base（会自动去掉末尾 `/`） |
-| `DIFY_API_KEYS` | 是 | - | Dify 应用 API Key（逗号分隔） |
-| `DIFY_SSL_VERIFY` | 否 | `true` | TLS 校验（自签证书可设为 `false`） |
-| `CONVERSATION_MEMORY_MODE` | 否 | `1` | `1` 全量 messages（最兼容）；`2` 提供 conversation_id 时仅发送增量（长对话更快） |
-| `TIMEOUT` | 否 | `30.0` | 访问 Dify 超时（秒） |
-| `SERVER_HOST` | 否 | `127.0.0.1` | 监听地址 |
-| `SERVER_PORT` | 否 | `8000` | 监听端口 |
-| `WORKERS` | 否 | `1` | Uvicorn workers |
-| `LOG_LEVEL` | 否 | `WARNING` | `DEBUG/INFO/WARNING/ERROR` |
-| `ANTHROPIC_API_BASE` | 否 | `https://api.anthropic.com` | Anthropic API Base |
-| `ANTHROPIC_API_KEY` | 否* | - | Anthropic API Key（启用 `/anthropic/*` 时必填） |
-| `ANTHROPIC_MODEL` | 否* | - | Anthropic 上游模型（不填则使用请求里的 `model`） |
-| `ANTHROPIC_VERSION` | 否 | `2023-06-01` | Anthropic `anthropic-version` header |
-| `ANTHROPIC_MAX_TOKENS` | 否 | `1024` | 未传 `max_tokens` 时的默认值 |
-| `ANTHROPIC_SSL_VERIFY` | 否 | `true` | TLS 校验（自签证书可设为 `false`） |
-| `UPSTREAM_OPENAI_BASE_URL` | 否* | - | 2anthropic 上游 OpenAI ChatCompletions（可为 base 或完整 `/v1/chat/completions`） |
-| `UPSTREAM_OPENAI_API_KEY` | 否* | - | 2anthropic 上游 API Key（Authorization Bearer） |
-| `UPSTREAM_OPENAI_MODEL` | 否 | - | 2anthropic 上游默认模型（不填则使用请求里的 `model`） |
-| `UPSTREAM_OPENAI_MODEL_MAP` | 否 | - | 2anthropic model 映射（`in:out`，逗号分隔，优先级高于 `UPSTREAM_OPENAI_MODEL`） |
-| `UPSTREAM_OPENAI_MAX_TOKENS` | 否 | `1024` | 2anthropic 未传 `max_tokens` 时默认值 |
-| `UPSTREAM_OPENAI_SSL_VERIFY` | 否 | `true` | 2anthropic TLS 校验（自签证书可设为 `false`） |
+#### OpenAI Python SDK
 
-兼容旧变量名（2anthropic 上游）：`base_url` / `api_key` / `model`（等价于 `UPSTREAM_OPENAI_BASE_URL` / `UPSTREAM_OPENAI_API_KEY` / `UPSTREAM_OPENAI_MODEL`）。
+```python
+from openai import OpenAI
 
-## 模型映射
+client = OpenAI(
+    api_key="sk-your-secret-key",
+    base_url="http://127.0.0.1:8000/v1",
+)
 
-启动时会用每个 `DIFY_API_KEY` 调用 Dify `/info` 获取应用名，并在 `/v1/models` 中用“应用名”作为 `model` 返回。
+resp = client.chat.completions.create(
+    model="my-dify-app",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)
+```
 
-## 使用示例
+#### 带工具调用示例
 
-### curl
+```python
+resp = client.chat.completions.create(
+    model="my-dify-app",
+    messages=[{"role": "user", "content": "读取当前目录"}],
+    tools=[
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "列出目录内容",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "目录路径"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }
+    ],
+)
+print(resp.choices[0].message.tool_calls)
+```
+
+#### 流式输出
+
+```python
+stream = client.chat.completions.create(
+    model="my-dify-app",
+    messages=[{"role": "user", "content": "写一篇关于AI的短文"}],
+    stream=True,
+    stream_options={"include_usage": True},
+)
+
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="")
+```
+
+#### curl
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-abc123" \
+  -H "Authorization: Bearer sk-your-secret-key" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"Your-Dify-App-Name\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}"
+  -d '{
+    "model": "my-dify-app",
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
 ```
 
-### OpenAI Python SDK（Chat Completions）
+## 配置详解
 
-```python
-from openai import OpenAI
+### 服务器配置
 
-client = OpenAI(
-    api_key="sk-abc123",
-    base_url="http://127.0.0.1:8000/v1",
-)
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `SERVER_HOST` | `127.0.0.1` | 监听地址 |
+| `SERVER_PORT` | `8000` | 监听端口 |
+| `LOG_LEVEL` | `WARNING` | 日志级别：DEBUG \| INFO \| WARNING \| ERROR |
 
-resp = client.chat.completions.create(
-    model="Your-Dify-App-Name",
-    messages=[{"role": "user", "content": "你好"}],
-)
-print(resp.choices[0].message.content)
+### 认证配置
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `AUTH_MODE` | `required` | `required` 校验 API Key，`disabled` 不校验（仅内网） |
+| `VALID_API_KEYS` | - | 代理层 API Key，多个用逗号分隔 |
+
+### Dify 配置
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DIFY_API_BASE` | `https://api.dify.ai/v1` | Dify API 地址 |
+| `DIFY_API_KEY` | - | 单个 Dify 应用的 API Key |
+| `DIFY_MODEL_NAME` | `dify-model` | 单应用模式下的 model 名称 |
+| `DIFY_MODEL_MAP` | - | 多应用映射：`模型名:app-key,模型名2:app-key2` |
+| `TIMEOUT` | `120` | Dify 请求超时（秒） |
+| `POOL_SIZE` | `50` | HTTP 连接池大小 |
+
+### 会话模式
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CONVERSATION_MODE` | `auto` | `none` 每次新对话，`auto` 自动复用 Dify 会话 |
+
+### 弱模型优化
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `STRIP_SYSTEM_AFTER_FIRST` | `false` | 首次之后是否省略系统提示词（利用 Dify 会话记忆） |
+| `SYSTEM_PROMPT_MAX_LENGTH` | `0` | 系统提示词最大长度，0=不截断 |
+| `SIMPLIFIED_TOOL_DEFS` | `true` | 使用简化的工具定义格式（推荐弱模型开启） |
+| `TOOL_DESC_MAX_LENGTH` | `120` | 工具描述最大长度 |
+| `ONLY_RECENT_MESSAGES` | `0` | 仅发送最近 N 条消息，0=全部 |
+
+### 工具调用约束
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `TOOL_CALL_STRICTNESS` | `2` | 0~6 级强度（见上文表格） |
+| `USE_TOOL_TOKEN` | 自动 | 是否使用 token 标签防串扰（默认 strictness>=1 开启） |
+| `AGGRESSIVE_TOOL_RECOVERY` | 自动 | 是否启用正则兜底抢救（默认 strictness>=3 开启） |
+| `SAVAGE_LOG_REDACT` | `true` | Level 5 脏话模式下是否脱敏日志 |
+
+### 工具描述摘要缓存（实验）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `TOOL_DESC_DIGEST_ENABLED` | `false` | 是否开启摘要缓存 |
+| `TOOL_DESC_DIGEST_DIR` | `.cache/prompt_digest` | 缓存目录 |
+| `TOOL_DESC_DIGEST_MAX_CHARS` | `40` | 摘要最大字符数 |
+
+### 流量日志
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `REQUEST_LOG_ENABLED` | `false` | 是否开启请求/响应日志 |
+| `REQUEST_LOG_DIR` | `logs` | 日志目录 |
+| `REQUEST_LOG_MAX_SIZE` | `52428800` | 单日志文件最大字节（50MB） |
+| `REQUEST_LOG_BACKUP_COUNT` | `5` | 保留历史日志数量 |
+| `REQUEST_LOG_MAX_BODY` | `0` | 单条记录 body 最大字符，0=不截断 |
+
+## 提示词方言
+
+OpenDify Lite 支持三种提示词渲染方言，通过 `PROMPT_DIALECT` 配置：
+
+### Generic（默认）
+
+使用 `[Role]: content` 的纯文本格式 + `<tool-calls>[JSON]</tool-calls>` 标签。
+
+```
+[System]: 你是一个有用的助手
+
+[User]: 你好
+
+[Assistant]: 你好！有什么我可以帮你的？
+
+# 可用工具
+...
 ```
 
-### OpenAI Python SDK（Anthropic 后端 / Chat Completions）
+### Claude
 
-注：该接口需配置 `.env` 的 `ANTHROPIC_API_KEY`；OpenAI SDK 的 `base_url` 需要包含 `/v1`；如果是 Claude Code/Anthropic SDK，请使用 `http://127.0.0.1:8000/anthropic` 作为 base（SDK 会自动拼 `/v1/...`）。
+使用 Claude 原生的 `<system>` / `<user>` / `<assistant>` 标签格式。
 
-```python
-from openai import OpenAI
+### OpenAI
 
-client = OpenAI(
-    api_key="sk-abc123",
-    base_url="http://127.0.0.1:8000/anthropic/v1",
-)
+使用 ChatML 风格 `<|im_start|>` / `<|im_end|>` 标签，适配 Hermes / Qwen 等模型。
 
-resp = client.chat.completions.create(
-    model="claude-3-5-sonnet-20241022",  # 也可在 .env 里通过 ANTHROPIC_MODEL 固定上游模型
-    messages=[{"role": "user", "content": "你好"}],
-)
-print(resp.choices[0].message.content)
+## API 端点
+
+### `POST /v1/chat/completions`
+
+OpenAI 兼容的聊天补全接口。
+
+**请求参数：**
+- `model` - 模型名称（对应 DIFY_MODEL_MAP 中的键）
+- `messages` - 消息列表
+- `tools` - 工具定义列表（可选）
+- `tool_choice` - 工具选择策略（可选）
+- `stream` - 是否流式输出（可选）
+- `stream_options` - 流式选项（可选）
+- `conversation_id` - 指定 Dify 会话 ID（可选）
+
+**响应头：**
+- `X-Dify-Conversation-Id` - Dify 会话 ID，可用于后续请求复用
+
+### `GET /v1/models`
+
+列出可用模型。
+
+### `GET /v1/models/{model_id}`
+
+获取指定模型信息。
+
+## 会话管理
+
+OpenDify Lite 按 `(model, system_prompt)` 维度管理会话：
+
+1. 首次请求：创建新会话，获得 Dify `conversation_id`
+2. 后续请求：自动复用会话，累积 usage
+3. 新任务检测：当消息数从 >1 回落至 1 时，自动重置会话
+4. 手动指定：可通过 `X-Dify-Conversation-Id` header 或 `conversation_id` body 字段强制指定
+
+## 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     客户端 (OpenAI SDK)                      │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────┐
+│                     FastAPI 入口层                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │  Auth 验证   │  │  流量日志    │  │  异常处理        │  │
+│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────┐
+│                     请求转换层                               │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  会话管理 (SessionStore)                              │  │
+│  │  - 按 (model, system_prompt) 分组                     │  │
+│  │  - 追踪 conversation_id / token / 累计 usage         │  │
+│  └──────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  方言渲染 (Generic / Claude / OpenAI)                 │  │
+│  │  - 消息格式化                                         │  │
+│  │  - 工具提示词注入（含强度约束）                       │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────┐
+│                     Dify 上游调用                            │
+│  ┌──────────────────┐  ┌──────────────────────────────┐    │
+│  │  流式 (SSE)      │  │  非流式 (Blocking)            │    │
+│  └──────────────────┘  └──────────────────────────────┘    │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────┐
+│                     响应转换层                               │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  工具调用提取 (XML 标签解析 + 正则兜底)               │  │
+│  └──────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  OpenAI 格式封装 (流式/非流式)                        │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────┐
+│                     返回客户端                               │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### OpenAI Python SDK（Responses）
+## 项目结构
 
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    api_key="sk-abc123",
-    base_url="http://127.0.0.1:8000/v1",
-)
-
-resp = client.responses.create(
-    model="Your-Dify-App-Name",
-    input="你好",
-)
-print(resp.output[0].content[0].text)
 ```
-
-### Claude / Anthropic Messages（curl）
-
-```bash
-curl http://127.0.0.1:8000/anthropic/v1/messages \
-  -H "X-API-Key: sk-abc123" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "Content-Type: application/json" \
-  -d "{\"model\":\"claude-opus-4-5\",\"max_tokens\":256,\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}"
+OpenDify Lite/
+├── app.py                      # 入口启动脚本
+├── requirements.txt            # 依赖
+├── .env.example               # 配置示例
+├── README.md                  # 本文档
+└── opendify/
+    ├── __init__.py
+    ├── config.py              # 配置加载、全局常量
+    ├── server.py              # FastAPI 应用、路由
+    ├── auth.py                # API Key 验证
+    ├── sessions.py            # 会话管理
+    ├── transforms.py          # OpenAI → Dify 请求转换
+    ├── responses.py           # Dify → OpenAI 响应转换
+    ├── streaming.py           # 流式处理
+    ├── tool_prompt.py         # 工具提示词生成（含 0~6 级约束）
+    ├── tool_calls.py          # 工具调用提取
+    ├── tool_digest.py         # 工具描述摘要缓存（实验）
+    ├── traffic_log.py         # 流量日志
+    ├── http_client.py         # HTTP 客户端
+    ├── errors.py              # 错误定义
+    ├── utils.py               # 工具函数
+    └── dialects/              # 提示词方言
+        ├── __init__.py
+        ├── generic.py         # Generic 方言
+        ├── claude.py          # Claude 方言
+        └── openai.py          # OpenAI 方言
 ```
-
-注：也可直接用 `POST /v1/messages`（Dify 后端）；鉴权也可使用 `Authorization: Bearer sk-abc123`（与 OpenAI 接口一致）。
-
-### Claude Code / Anthropic SDK（推荐）
-
-你需要配置两部分：
-
-1) OpenDify 服务端（`.env`）：配置上游 OpenAI ChatCompletions（这是“被转换的接口”）
-
-- `UPSTREAM_OPENAI_BASE_URL`（或旧变量 `base_url`）指向你的 OpenAI 兼容地址（例如 `https://127.0.0.1:8080/v1/chat/completions`）
-- `UPSTREAM_OPENAI_API_KEY`（或旧变量 `api_key`）为上游 key
-- `UPSTREAM_OPENAI_MODEL`（或旧变量 `model`）为上游默认模型（可选）
-
-2) Claude Code / Anthropic SDK 客户端：把 base_url 指向 OpenDify（这是“转换后的 Anthropic 接口”）
-
-- base_url：`http://127.0.0.1:8000/anthropic`（不要带 `/v1`）
-- api_key：使用 OpenDify 的 `VALID_API_KEYS` 之一
-
-说明：`ANTHROPIC_API_BASE` 是 OpenDify 用来访问“真实 Anthropic 上游（/v1/messages）”的配置，只影响 `/anthropic/v1/chat/completions`；它不能指向 OpenAI 的 `/v1/chat/completions`。
-要求：你的上游 OpenAI 兼容接口需要支持 `tools/tool_calls`（函数调用）；否则 Claude Code 会因无法执行工具调用而报错（常见提示：`Improperly formed request`）。
-
-## Tool calls（tools/tool_calls）
-
-- 请求中可带 `tools` / `tool_choice`（OpenAI 标准参数）。
-- 响应会尽量输出标准 `tool_calls`，并保证 `function.arguments` 为 JSON 字符串。
-- 注意：工具函数不会在 OpenDify/模型侧自动执行；需要由你的客户端执行工具并把结果以 `role="tool"` 消息回传给 `/v1/chat/completions`。
-
-## 流式（SSE）
-
-- 传 `stream=true` 返回 `text/event-stream`，格式为 OpenAI 的 `chat.completion.chunk`。
-- 可选支持 `stream_options: {"include_usage": true}`（若 Dify 结束事件提供 usage，则透传；否则返回 0）。
-- `/v1/responses` 流式会输出带 `type` + `sequence_number` 的事件，并以 `data: [DONE]` 结束。
-- `/v1/messages` 流式为 Anthropic/Claude 事件格式（`event:` + `data:`）。
-
-## conversation_id（可选）
-
-为了在 Dify 侧复用对话上下文：
-
-- 非流式响应会在 header 中返回 `X-Dify-Conversation-Id`（若 Dify 返回了 conversation_id）。
-- 下次请求可通过 header `X-Dify-Conversation-Id` 或 body 字段 `conversation_id` 传回；并可配合 `CONVERSATION_MEMORY_MODE=2` 提升长对话性能。
 
 ## 测试
 
@@ -180,9 +362,14 @@ curl http://127.0.0.1:8000/anthropic/v1/messages \
 python test.py
 ```
 
-`test.py`：包含 Unit + Integration；Integration 需先启动服务（`python app.py`），并默认从 `.env` 读取配置（也可用 `TEST_SERVER_ORIGIN/TEST_PROXY_API_KEY/TEST_DIFY_MODEL/TEST_CLAUDE_MODEL` 覆盖）。
+测试包含单元测试和集成测试。集成测试需要先启动服务，默认从 `.env` 读取配置。
 
-## 兼容性说明（当前实现）
+## 兼容性说明
 
-- 仅支持 `n=1`（其它会返回 400）。
-- `/v1/responses` 与 `/v1/messages` 覆盖常用字段与流式输出（含 `sequence_number`/事件格式）；未实现 Embeddings 等其它接口。
+- 仅支持 `n=1`，其他值返回 400
+- 支持 OpenAI Chat Completions 核心参数
+- 暂不支持 Embeddings / Fine-tuning 等其他接口
+
+## 许可证
+
+MIT License

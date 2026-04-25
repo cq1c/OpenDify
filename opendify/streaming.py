@@ -28,6 +28,7 @@ async def stream_and_capture_cid(
     session: Dict[str, Any],
     request_id: str,
     tools: Optional[List[Dict[str, Any]]] = None,
+    local_prompt_tokens: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     # 工具调用开始标签可能是：<tool-calls>、<tool-calls token="xxxx">
     # HOLDBACK 取最长可能的开始标签长度上限，保证流里不会提前暴露半截标签。
@@ -131,13 +132,28 @@ async def stream_and_capture_cid(
                     if CONVERSATION_MODE == "auto":
                         usage_obj = sessions.accumulate_usage(session, meta_usage)
                     else:
+                        # 非 conversation 模式: 上游每轮独立, prompt_tokens 容易随
+                        # Dify 内部模板抖动。优先用本地基于 query 文本计算的稳定值,
+                        # 仅当本地估算缺失或上游显著更高 (说明上游算上了模板开销) 时
+                        # 退回上游报数。
+                        upstream_prompt = int(meta_usage.get("prompt_tokens") or 0)
+                        completion = int(meta_usage.get("completion_tokens") or 0)
+                        if local_prompt_tokens is not None:
+                            prompt = max(local_prompt_tokens, upstream_prompt)
+                        else:
+                            prompt = upstream_prompt
                         usage_obj = {
-                            "prompt_tokens": int(meta_usage.get("prompt_tokens") or 0),
-                            "completion_tokens": int(
-                                meta_usage.get("completion_tokens") or 0
-                            ),
-                            "total_tokens": int(meta_usage.get("total_tokens") or 0),
+                            "prompt_tokens": prompt,
+                            "completion_tokens": completion,
+                            "total_tokens": prompt + completion,
                         }
+                elif local_prompt_tokens is not None and CONVERSATION_MODE != "auto":
+                    # 上游没给 usage, 用本地估算保底
+                    usage_obj = {
+                        "prompt_tokens": local_prompt_tokens,
+                        "completion_tokens": 0,
+                        "total_tokens": local_prompt_tokens,
+                    }
 
                 if tool_mode:
                     _, tool_calls = extract_tool_calls(accumulated, tool_token, tools=tools)

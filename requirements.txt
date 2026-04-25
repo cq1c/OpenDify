@@ -7,3 +7,5 @@ openai
 psutil
 typing-extensions
 python-multipart
+tiktoken
+json-repair

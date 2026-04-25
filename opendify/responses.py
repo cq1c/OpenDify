@@ -20,6 +20,7 @@ def build_openai_response(
     tool_token: Optional[str] = None,
     session: Optional[Dict[str, Any]] = None,
     tools: Optional[List[Dict[str, Any]]] = None,
+    local_prompt_tokens: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     answer = dify_resp.get("answer", "")
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -43,10 +44,17 @@ def build_openai_response(
     if session is not None and CONVERSATION_MODE == "auto":
         usage_out = sessions.accumulate_usage(session, usage_raw)
     else:
+        # 非 conversation 模式: prompt_tokens 用本地估算稳住, 避免随上游波动。
+        upstream_prompt = int(usage_raw.get("prompt_tokens") or 0)
+        completion = int(usage_raw.get("completion_tokens") or 0)
+        if local_prompt_tokens is not None:
+            prompt = max(local_prompt_tokens, upstream_prompt)
+        else:
+            prompt = upstream_prompt
         usage_out = {
-            "prompt_tokens": int(usage_raw.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage_raw.get("completion_tokens") or 0),
-            "total_tokens": int(usage_raw.get("total_tokens") or 0),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
         }
 
     resp = {

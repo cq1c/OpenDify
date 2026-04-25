@@ -5,7 +5,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Dict, Optional
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +29,7 @@ from .sessions import sessions
 from .streaming import stream_and_capture_cid
 from .traffic_log import traffic_log
 from .transforms import extract_text, transform_openai_to_dify
-from .utils import fast_id
+from .utils import estimate_tokens, fast_id
 
 
 @asynccontextmanager
@@ -154,6 +154,12 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
 
     tool_token = dify_req.pop("_tool_token", None)
 
+    # 非 conversation 模式下用 query 文本本地估算 prompt_tokens, 给客户端
+    # 一个稳定、确定性的"上下文计量"基线 (Dify 模板抖动不再影响显示)。
+    local_prompt_tokens: Optional[int] = None
+    if CONVERSATION_MODE != "auto":
+        local_prompt_tokens = estimate_tokens(dify_req.get("query") or "")
+
     # 记录 Dify 请求
     traffic_log.log_dify_request(
         request_id,
@@ -204,6 +210,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
                 session=session,
                 request_id=request_id,
                 tools=openai_req.get("tools") or None,
+                local_prompt_tokens=local_prompt_tokens,
             ),
             media_type="text/event-stream",
             headers={
@@ -241,6 +248,7 @@ async def chat_completions(request: Request, api_key: str = Depends(verify_api_k
         tool_token,
         session=session,
         tools=openai_req.get("tools") or None,
+        local_prompt_tokens=local_prompt_tokens,
     )
 
     if cid:

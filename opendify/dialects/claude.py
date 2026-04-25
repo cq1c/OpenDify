@@ -1,19 +1,30 @@
 """
-Claude 方言: Anthropic 原生 XML 风格。
+Claude 方言: 对齐 Anthropic 当前线上提示词的官方风格。
 
-Query 文本:
-  <system>...</system>
-  <tools><tool>...</tool></tools>
-  <user>...</user>
-  <assistant>... <function_calls><invoke name="X"><parameter name="p">v</parameter></invoke></function_calls></assistant>
-  <user><function_results><result>...</result></function_results></user>
+提示词布局 (与 Claude 官方系统提示同形):
+    In this environment you have access to a set of tools ...
+    You can invoke functions by writing a "<function_calls>" block ...
 
-期望模型输出:
-  <function_calls [token="XXX"]>
-  <invoke name="tool_x">
-  <parameter name="p">value</parameter>
-  </invoke>
-  </function_calls>
+    <function_calls>
+    <invoke name="$FUNCTION_NAME">
+    <parameter name="$PARAMETER_NAME">$PARAMETER_VALUE</parameter>
+    ...
+    </invoke>
+    </function_calls>
+
+    String and scalar parameters should be specified as is, while lists
+    and objects should use JSON format.
+
+    Here are the functions available in JSONSchema format:
+    <functions>
+    <function>{"description": "...", "name": "...", "parameters": {...}}</function>
+    ...
+    </functions>
+
+会话拼接仍用 <system>/<user>/<assistant> 作为 turn marker (Dify
+单 query 通道下的本地约定), 工具结果继续用 <function_results><result>。
+
+解析侧兼容 antml: 命名空间前缀以及常见破损/同义写法。
 """
 
 import json
@@ -42,17 +53,47 @@ from ..tool_digest import tool_desc_digest
 from ..utils import extract_text, truncate
 
 CLOSE_TAG = "</function_calls>"
-_OPEN_ATTR = r'(?:\s+token="([^"]*)")?'
-OPEN_TAG_PATTERN = re.compile(rf"<function_calls{_OPEN_ATTR}\s*>", re.IGNORECASE)
+# 可选命名空间前缀: 兼容 Claude 内部使用的 antml: 形式
+_NS = r"(?:antml:)?"
+# 宽松匹配 token 属性: 可选 name=、单/双/无引号、token 也可写成 tok 或省略
+_OPEN_ATTR = r'(?:\s+(?:token|tok)\s*=\s*["\']?([^"\'\s>]*)["\']?)?'
+# 兼容 function_calls / function_call (单复数) 以及 tool_calls / tool_call 同义写法
+_FC_NAMES = rf"{_NS}(?:function_calls?|tool_calls?|fnc|function-calls?)"
+_INVOKE_NAME = rf"{_NS}invoke"
+_PARAM_NAME = rf"{_NS}(?:parameter|param|arg)"
+OPEN_TAG_PATTERN = re.compile(
+    rf"<\s*{_FC_NAMES}{_OPEN_ATTR}[^>]*>", re.IGNORECASE
+)
+_CLOSE_TAG_PATTERN = re.compile(
+    rf"<\s*/\s*{_FC_NAMES}\s*>", re.IGNORECASE
+)
 _BLOCK_PATTERN = re.compile(
-    rf"<function_calls{_OPEN_ATTR}\s*>(.*?)</function_calls>",
+    rf"<\s*{_FC_NAMES}{_OPEN_ATTR}[^>]*>(.*?)<\s*/\s*{_FC_NAMES}\s*>",
     re.DOTALL | re.IGNORECASE,
 )
+# invoke: 接受 <invoke name="x"> / <invoke name='x'> / <invoke name=x> / <invoke x> / <invoke ...>
 _INVOKE_PATTERN = re.compile(
-    r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL | re.IGNORECASE
+    rf'<\s*{_INVOKE_NAME}\s+(?:name\s*=\s*)?["\']?([A-Za-z_][\w\-.]*)["\']?[^>]*>'
+    rf'(.*?)<\s*/\s*{_INVOKE_NAME}\s*>',
+    re.DOTALL | re.IGNORECASE,
 )
+# 同上, 但允许丢失 </invoke> 收尾 (后续被另一个 <invoke> 或 </function_calls> 终结)
+_INVOKE_LOOSE_PATTERN = re.compile(
+    rf'<\s*{_INVOKE_NAME}\s+(?:name\s*=\s*)?["\']?([A-Za-z_][\w\-.]*)["\']?[^>]*>'
+    rf'(.*?)(?=<\s*{_INVOKE_NAME}\s|<\s*/\s*{_FC_NAMES}\s*>|\Z)',
+    re.DOTALL | re.IGNORECASE,
+)
+# parameter: 接受 <parameter name="x"> / <parameter name=x> / <parameter x> / <parameter ...>
 _PARAM_PATTERN = re.compile(
-    r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL | re.IGNORECASE
+    rf'<\s*{_PARAM_NAME}\s+(?:name\s*=\s*)?["\']?([A-Za-z_][\w\-.]*)["\']?[^>]*>'
+    rf'(.*?)<\s*/\s*{_PARAM_NAME}\s*>',
+    re.DOTALL | re.IGNORECASE,
+)
+# 兜底: 缺失 </parameter> 时, 用下一个 <parameter> 或 </invoke> 截断
+_PARAM_LOOSE_PATTERN = re.compile(
+    rf'<\s*{_PARAM_NAME}\s+(?:name\s*=\s*)?["\']?([A-Za-z_][\w\-.]*)["\']?[^>]*>'
+    rf'(.*?)(?=<\s*{_PARAM_NAME}\s|<\s*/\s*{_INVOKE_NAME}\s*>|<\s*/\s*{_FC_NAMES}\s*>|\Z)',
+    re.DOTALL | re.IGNORECASE,
 )
 HOLDBACK = 55  # `<function_calls token="XXXXXX">` 约 35 字, 预留余量
 
@@ -71,6 +112,10 @@ def _build_open_tag(token: Optional[str]) -> str:
 def _render_tool(
     func: Dict[str, Any], dify_key: Optional[str] = None
 ) -> str:
+    """
+    Anthropic 官方风格: 一行 `<function>{JSON}</function>`,
+    JSON 体含 description / name / parameters (JSONSchema)。
+    """
     name = func.get("name", "unknown")
     raw_desc = func.get("description", "") or ""
     cached = tool_desc_digest.load(name, raw_desc) if raw_desc else None
@@ -80,18 +125,16 @@ def _render_tool(
         desc = truncate(raw_desc, TOOL_DESC_MAX_LENGTH * 2)
         if dify_key and raw_desc:
             tool_desc_digest.schedule_generate(dify_key, name, raw_desc)
-    params = func.get("parameters") or {}
+    obj: Dict[str, Any] = {
+        "description": desc,
+        "name": name,
+        "parameters": func.get("parameters") or {},
+    }
     if SIMPLIFIED_TOOL_DEFS:
-        schema_str = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+        body = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     else:
-        schema_str = json.dumps(params, ensure_ascii=False, indent=2)
-    return (
-        f"<tool>\n"
-        f"<name>{name}</name>\n"
-        f"<description>{desc}</description>\n"
-        f"<input_schema>\n{schema_str}\n</input_schema>\n"
-        f"</tool>"
-    )
+        body = json.dumps(obj, ensure_ascii=False, indent=2)
+    return f"<function>{body}</function>"
 
 
 def _build_tool_prompt(
@@ -110,62 +153,64 @@ def _build_tool_prompt(
             continue
         tool_blocks.append(_render_tool(fn, dify_key=dify_key))
 
-    tools_xml = "<tools>\n" + "\n".join(tool_blocks) + "\n</tools>"
+    functions_xml = "<functions>\n" + "\n".join(tool_blocks) + "\n</functions>"
 
     tag_open = _build_open_tag(token)
 
+    # Anthropic 官方示例: 用 $FUNCTION_NAME / $PARAMETER_NAME / $PARAMETER_VALUE 占位
     example = (
         f"{tag_open}\n"
-        '<invoke name="example_tool">\n'
-        '<parameter name="p1">value1</parameter>\n'
+        '<invoke name="$FUNCTION_NAME">\n'
+        '<parameter name="$PARAMETER_NAME">$PARAMETER_VALUE</parameter>\n'
+        "...\n"
         "</invoke>\n"
+        "...\n"
         "</function_calls>"
     )
 
-    if level <= 0:
-        intro = (
-            f"若需调用工具, 在正文之后输出 `{tag_open} ... </function_calls>` 块。"
-            "每个 `<parameter>` 内为该参数的值 (字符串原样, 复杂类型写 JSON)。"
-        )
-        token_note = ""
-        if token and USE_TOOL_TOKEN:
-            token_note = f' 本次令牌为 "{token}"。'
-        return f"{tools_xml}\n\n{intro}{token_note}".strip()
-
-    constraints = [
-        f"- 工具调用必须包裹在 `{tag_open}` 与 `</function_calls>` 之间, 缺一不可。",
-        '- 每个调用写一个 `<invoke name="工具名">...</invoke>`, 可并列多个 invoke。',
-        '- 参数用 `<parameter name="参数名">值</parameter>`, 字符串原样写, 数字/布尔/数组/对象请写合法 JSON 字面量。',
-        "- 无需调用工具时整个 `<function_calls>` 块不要出现。",
+    # 头部: 严格对齐 Anthropic 线上 system prompt 的开场白
+    intro_lines = [
+        "In this environment you have access to a set of tools you can use to "
+        "answer the user's question.",
+        f'You can invoke functions by writing a "{tag_open}" block like the '
+        "following as part of your reply to the user:",
+        "",
+        example,
+        "",
+        "String and scalar parameters should be specified as is, while lists "
+        "and objects should use JSON format.",
     ]
+
+    # 可选: 令牌防回放 (OpenDify 的扩展, 不属 Anthropic 标准)
     if token and USE_TOOL_TOKEN:
-        constraints.append(
-            f'- 本次令牌必须是 "{token}", 严禁照抄历史或自行编造。'
+        intro_lines.append("")
+        intro_lines.append(
+            f'The token attribute on `<function_calls>` for THIS turn is '
+            f'"{token}". Do not copy historical or invented tokens.'
         )
         if prev_tokens:
             expired = ", ".join(f'"{t}"' for t in prev_tokens[-5:])
-            constraints.append(f"  (历史令牌 {expired} 已全部作废)")
+            intro_lines.append(f"(Historical tokens {expired} are now expired.)")
 
-    header = "# 可用工具"
-    intro = "若需调用工具, 在正文之后追加一个 XML 块:"
-    final = ""
+    # 工具清单 (官方风格固定语)
+    intro_lines.append("")
+    intro_lines.append("Here are the functions available in JSONSchema format:")
+    intro_lines.append(functions_xml)
+
+    # 强度分级补充约束 (level >= 2 起加强)
     if level >= 2:
-        header = "# 可用工具 ⚠️"
-        intro = (
-            f"⚠️ 强制格式: 涉及工具调用时, 必须以 `{tag_open}` 开头、"
-            f"`</function_calls>` 结尾, 违反将被拒收。"
+        intro_lines.append("")
+        intro_lines.append(
+            "Format is mandatory: tool invocations missing the "
+            f"`{tag_open}` ... `</function_calls>` envelope will be rejected."
         )
     if level >= 3:
-        final = (
-            f"\n\n⚠️ 最终检查: 没有 `</function_calls>` 收尾的响应会被系统丢弃, "
-            "用户看不到任何内容。"
+        intro_lines.append(
+            "If your response has no `</function_calls>` closing tag, "
+            "the entire output is discarded and the user sees nothing."
         )
 
-    return (
-        f"{header}\n\n{tools_xml}\n\n"
-        f"---\n\n{intro}\n\n{example}\n\n"
-        "约束:\n" + "\n".join(constraints) + final
-    ).strip()
+    return "\n".join(intro_lines).strip()
 
 
 def _render_assistant(msg: Dict[str, Any]) -> str:
@@ -342,19 +387,36 @@ def _parse_parameter_value(raw: str) -> Any:
     return raw  # 字符串原样 (保留前后空白也无妨, schema coerce 会处理)
 
 
+def _extract_params(body: str) -> Dict[str, Any]:
+    """先按严格 <parameter>...</parameter> 提取, 没有就用宽松模式兜底。"""
+    args: Dict[str, Any] = {}
+    matches = list(_PARAM_PATTERN.finditer(body))
+    if not matches:
+        matches = list(_PARAM_LOOSE_PATTERN.finditer(body))
+    for pm in matches:
+        pname = pm.group(1).strip()
+        if not pname or pname.lower() == "name":
+            continue
+        pval = _parse_parameter_value(pm.group(2))
+        args[pname] = pval
+    return args
+
+
 def _invokes_to_calls(
     invokes_text: str, tools: Optional[List[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
     name_map = _tools_by_name(tools)
     calls: List[Dict[str, Any]] = []
-    for m in _INVOKE_PATTERN.finditer(invokes_text):
+    matches = list(_INVOKE_PATTERN.finditer(invokes_text))
+    if not matches:
+        # 缺 </invoke> 兜底
+        matches = list(_INVOKE_LOOSE_PATTERN.finditer(invokes_text))
+    for m in matches:
         name = m.group(1).strip()
+        if not name:
+            continue
         body = m.group(2)
-        args: Dict[str, Any] = {}
-        for pm in _PARAM_PATTERN.finditer(body):
-            pname = pm.group(1).strip()
-            pval = _parse_parameter_value(pm.group(2))
-            args[pname] = pval
+        args = _extract_params(body)
         spec = name_map.get(name)
         if isinstance(spec, dict):
             schema = spec.get("parameters") or {}
@@ -413,13 +475,25 @@ def extract_tool_calls(
             return clean_text, parsed_list
 
     # ── 3) 裸 invoke (模型忘写外壳) ──
-    if _INVOKE_PATTERN.search(text):
-        first = _INVOKE_PATTERN.search(text)
-        clean_text = text[: first.start()].rstrip() if first else text
+    first = _INVOKE_PATTERN.search(text) or _INVOKE_LOOSE_PATTERN.search(text)
+    if first:
+        clean_text = text[: first.start()].rstrip()
         calls = _invokes_to_calls(text, tools)
         parsed_list = _normalize_tool_calls(calls) if calls else []
         if parsed_list:
             return clean_text, parsed_list
+
+    # ── 3b) 仅有 </function_calls> 收尾, 缺开始标签 ──
+    close_match = _CLOSE_TAG_PATTERN.search(text)
+    if close_match:
+        body = text[: close_match.start()]
+        if _INVOKE_PATTERN.search(body) or _INVOKE_LOOSE_PATTERN.search(body):
+            inv = _INVOKE_PATTERN.search(body) or _INVOKE_LOOSE_PATTERN.search(body)
+            calls = _invokes_to_calls(body, tools)
+            parsed_list = _normalize_tool_calls(calls) if calls else []
+            if parsed_list:
+                clean_text = text[: inv.start()].rstrip()
+                return clean_text, parsed_list
 
     # ── 4) 跨方言兜底: 模型输出了 generic / openai 格式 ──
     from ..tool_calls import extract_tool_calls as _generic_extract
